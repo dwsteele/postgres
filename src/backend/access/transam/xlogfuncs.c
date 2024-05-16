@@ -122,12 +122,13 @@ pg_backup_start(PG_FUNCTION_ARGS)
 Datum
 pg_backup_stop(PG_FUNCTION_ARGS)
 {
-#define PG_BACKUP_STOP_V2_COLS 3
+#define PG_BACKUP_STOP_V2_COLS 4
 	TupleDesc	tupdesc;
 	Datum		values[PG_BACKUP_STOP_V2_COLS] = {0};
 	bool		nulls[PG_BACKUP_STOP_V2_COLS] = {0};
 	bool		waitforarchive = PG_GETARG_BOOL(0);
 	char	   *backup_label;
+	bytea	   *pg_control_bytea;
 	SessionBackupState status = get_backup_status();
 
 	/* Initialize attributes information in the tuple descriptor */
@@ -149,9 +150,15 @@ pg_backup_stop(PG_FUNCTION_ARGS)
 	/* Build the contents of backup_label */
 	backup_label = build_backup_content(backup_state, false);
 
+	/* Build the contents of pg_control */
+	pg_control_bytea = (bytea *) palloc(PG_CONTROL_FILE_SIZE + VARHDRSZ);
+	SET_VARSIZE(pg_control_bytea, PG_CONTROL_FILE_SIZE + VARHDRSZ);
+	memcpy(VARDATA(pg_control_bytea), backup_state->controlFile, PG_CONTROL_FILE_SIZE);
+
 	values[0] = LSNGetDatum(backup_state->stoppoint);
 	values[1] = CStringGetTextDatum(backup_label);
 	values[2] = CStringGetTextDatum(tablespace_map->data);
+	values[3] = PointerGetDatum(pg_control_bytea);
 
 	/* Deallocate backup-related variables */
 	pfree(backup_label);
