@@ -164,7 +164,8 @@ typedef struct ControlFileData
 	 * from a backup, and must see a backup-end record before we can safely
 	 * start up.
 	 *
-	 * !!! backupLabelRequired
+	 * If backupLabelRequired is true, then a backup_label file must be
+	 * present in order for recovery to succeed.
 	 */
 	XLogRecPtr	minRecoveryPoint;
 	TimeLineID	minRecoveryPointTLI;
