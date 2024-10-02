@@ -9110,7 +9110,9 @@ get_backup_status(void)
  * wait for WAL segments to be archived.
  *
  * "state" is filled with the information necessary to restore from this
- * backup with its stop LSN (stoppoint), its timeline ID (stoptli), etc.
+ * backup with its stop LSN (stoppoint), its timeline ID (stoptli), etc. This
+ * includes a copy of pg_control with safeguards against it being used without
+ * backup_label.
  *
  * It is the responsibility of the caller of this function to verify the
  * permissions of the calling user!

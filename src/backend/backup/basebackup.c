@@ -347,15 +347,6 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 				/* Then the bulk of the files... */
 				sendDir(sink, ".", 1, false, state.tablespaces,
 						sendtblspclinks, &manifest, InvalidOid, ib);
-
-				/* End the backup before sending pg_control */
-				basebackup_progress_wait_wal_archive(&state);
-				do_pg_backup_stop(backup_state, !opt->nowait);
-
-				/* ... and pg_control after everything else. */
-				sendFileWithContent(sink, XLOG_CONTROL_FILE,
-									(char *)backup_state->controlFile,
-									PG_CONTROL_FILE_SIZE, &manifest);
 			}
 			else
 			{
@@ -372,7 +363,7 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 			 * include the xlog files below and stop afterwards. This is safe
 			 * since the main data directory is always sent *last*.
 			 */
-			if (opt->includewal && ti->path == NULL)
+			if (ti->path == NULL)
 			{
 				Assert(lnext(state.tablespaces, lc) == NULL);
 			}
@@ -388,6 +379,14 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 				bbsink_end_archive(sink);
 			}
 		}
+
+		basebackup_progress_wait_wal_archive(&state);
+		do_pg_backup_stop(backup_state, !opt->nowait);
+
+		/* Send pg_control */
+		sendFileWithContent(sink, XLOG_CONTROL_FILE,
+							(char *)backup_state->controlFile,
+							PG_CONTROL_FILE_SIZE, &manifest);
 
 		endptr = backup_state->stoppoint;
 		endtli = backup_state->stoptli;
@@ -627,16 +626,16 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 			StatusFilePath(pathbuf, fname, ".done");
 			sendFileWithContent(sink, pathbuf, "", -1, &manifest);
 		}
-
-		/* Properly terminate the tar file. */
-		StaticAssertStmt(2 * TAR_BLOCK_SIZE <= BLCKSZ,
-						 "BLCKSZ too small for 2 tar blocks");
-		memset(sink->bbs_buffer, 0, 2 * TAR_BLOCK_SIZE);
-		bbsink_archive_contents(sink, 2 * TAR_BLOCK_SIZE);
-
-		/* OK, that's the end of the archive. */
-		bbsink_end_archive(sink);
 	}
+
+	/* Properly terminate the tar file. */
+	StaticAssertStmt(2 * TAR_BLOCK_SIZE <= BLCKSZ,
+						"BLCKSZ too small for 2 tar blocks");
+	memset(sink->bbs_buffer, 0, 2 * TAR_BLOCK_SIZE);
+	bbsink_archive_contents(sink, 2 * TAR_BLOCK_SIZE);
+
+	/* OK, that's the end of the archive. */
+	bbsink_end_archive(sink);
 
 	AddWALInfoToBackupManifest(&manifest, state.startptr, state.starttli,
 							   endptr, endtli);
