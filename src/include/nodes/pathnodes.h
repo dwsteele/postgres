@@ -426,7 +426,11 @@ struct PlannerInfo
 	 * items to be proven redundant, implying that there is only one group
 	 * containing all the query's rows.  Hence, if you want to check whether
 	 * GROUP BY was specified, test for nonempty parse->groupClause, not for
-	 * nonempty processed_groupClause.
+	 * nonempty processed_groupClause.  Optimizer chooses specific order of
+	 * group-by clauses during the upper paths generation process, attempting
+	 * to use different strategies to minimize number of sorts or engage
+	 * incremental sort.  See preprocess_groupclause() and
+	 * get_useful_group_keys_orderings() for details.
 	 *
 	 * Currently, when grouping sets are specified we do not attempt to
 	 * optimize the groupClause, so that processed_groupClause will be
@@ -504,6 +508,12 @@ struct PlannerInfo
 	bool		placeholdersFrozen;
 	/* true if planning a recursive WITH item */
 	bool		hasRecursion;
+
+	/*
+	 * The rangetable index for the RTE_GROUP RTE, or 0 if there is no
+	 * RTE_GROUP RTE.
+	 */
+	int			group_rtindex;
 
 	/*
 	 * Information about aggregates. Filled by preprocess_aggrefs().
@@ -1468,14 +1478,21 @@ typedef struct PathKey
 } PathKey;
 
 /*
- * Combines the information about pathkeys and the associated clauses.
+ * Contains an order of group-by clauses and the corresponding list of
+ * pathkeys.
+ *
+ * The elements of 'clauses' list should have the same order as the head of
+ * 'pathkeys' list.  The tleSortGroupRef of the clause should be equal to
+ * ec_sortref of the pathkey equivalence class.  If there are redundant
+ * clauses with the same tleSortGroupRef, they must be grouped together.
  */
-typedef struct PathKeyInfo
+typedef struct GroupByOrdering
 {
 	NodeTag		type;
+
 	List	   *pathkeys;
 	List	   *clauses;
-} PathKeyInfo;
+} GroupByOrdering;
 
 /*
  * VolatileFunctionStatus -- allows nodes to cache their
@@ -1647,6 +1664,7 @@ typedef struct Path
 
 	/* estimated size/costs for path (see costsize.c for more info) */
 	Cardinality rows;			/* estimated number of result tuples */
+	int			disabled_nodes; /* count of disabled nodes */
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
@@ -2812,9 +2830,9 @@ typedef struct PlaceHolderVar
  * min_lefthand and min_righthand for higher joins.)
  *
  * jointype is never JOIN_RIGHT; a RIGHT JOIN is handled by switching
- * the inputs to make it a LEFT JOIN.  It's never JOIN_RIGHT_ANTI either.
- * So the allowed values of jointype in a join_info_list member are only
- * LEFT, FULL, SEMI, or ANTI.
+ * the inputs to make it a LEFT JOIN.  It's never JOIN_RIGHT_SEMI or
+ * JOIN_RIGHT_ANTI either.  So the allowed values of jointype in a
+ * join_info_list member are only LEFT, FULL, SEMI, or ANTI.
  *
  * ojrelid is the RT index of the join RTE representing this outer join,
  * if there is one.  It is zero when jointype is INNER or SEMI, and can be
@@ -3322,6 +3340,7 @@ typedef struct
 typedef struct JoinCostWorkspace
 {
 	/* Preliminary cost estimates --- must not be larger than final ones! */
+	int			disabled_nodes;
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 

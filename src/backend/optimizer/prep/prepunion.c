@@ -498,7 +498,7 @@ generate_recursion_path(SetOperationStmt *setOp, PlannerInfo *root,
  * interesting_pathkeys: if not NIL, also include paths that suit these
  * pathkeys, sorting any unsorted paths as required.
  * *pNumGroups: if not NULL, we estimate the number of distinct groups
- *		in the result, and store it there
+ * in the result, and store it there.
  */
 static void
 build_setop_child_paths(PlannerInfo *root, RelOptInfo *rel,
@@ -714,7 +714,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 	List	   *groupList = NIL;
 	Path	   *apath;
 	Path	   *gpath = NULL;
-	bool		try_sorted;
+	bool		try_sorted = false;
 	List	   *union_pathkeys = NIL;
 
 	/*
@@ -740,18 +740,21 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 								  tlist_list, refnames_tlist);
 	*pTargetList = tlist;
 
-	/* For for UNIONs (not UNION ALL), try sorting, if sorting is possible */
-	try_sorted = !op->all && grouping_is_sortable(op->groupClauses);
-
-	if (try_sorted)
+	/* For UNIONs (not UNION ALL), try sorting, if sorting is possible */
+	if (!op->all)
 	{
 		/* Identify the grouping semantics */
 		groupList = generate_setop_grouplist(op, tlist);
 
-		/* Determine the pathkeys for sorting by the whole target list */
-		union_pathkeys = make_pathkeys_for_sortclauses(root, groupList, tlist);
+		if (grouping_is_sortable(op->groupClauses))
+		{
+			try_sorted = true;
+			/* Determine the pathkeys for sorting by the whole target list */
+			union_pathkeys = make_pathkeys_for_sortclauses(root, groupList,
+														   tlist);
 
-		root->query_pathkeys = union_pathkeys;
+			root->query_pathkeys = union_pathkeys;
+		}
 	}
 
 	/*
@@ -1343,6 +1346,7 @@ choose_hashed_setop(PlannerInfo *root, List *groupClauses,
 	cost_agg(&hashed_p, root, AGG_HASHED, NULL,
 			 numGroupCols, dNumGroups,
 			 NIL,
+			 input_path->disabled_nodes,
 			 input_path->startup_cost, input_path->total_cost,
 			 input_path->rows, input_path->pathtarget->width);
 
@@ -1350,14 +1354,17 @@ choose_hashed_setop(PlannerInfo *root, List *groupClauses,
 	 * Now for the sorted case.  Note that the input is *always* unsorted,
 	 * since it was made by appending unrelated sub-relations together.
 	 */
+	sorted_p.disabled_nodes = input_path->disabled_nodes;
 	sorted_p.startup_cost = input_path->startup_cost;
 	sorted_p.total_cost = input_path->total_cost;
 	/* XXX cost_sort doesn't actually look at pathkeys, so just pass NIL */
-	cost_sort(&sorted_p, root, NIL, sorted_p.total_cost,
+	cost_sort(&sorted_p, root, NIL, sorted_p.disabled_nodes,
+			  sorted_p.total_cost,
 			  input_path->rows, input_path->pathtarget->width,
 			  0.0, work_mem, -1.0);
 	cost_group(&sorted_p, root, numGroupCols, dNumGroups,
 			   NIL,
+			   sorted_p.disabled_nodes,
 			   sorted_p.startup_cost, sorted_p.total_cost,
 			   input_path->rows);
 

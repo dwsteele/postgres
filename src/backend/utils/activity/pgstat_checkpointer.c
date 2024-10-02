@@ -49,12 +49,14 @@ pgstat_report_checkpointer(void)
 #define CHECKPOINTER_ACC(fld) stats_shmem->stats.fld += PendingCheckpointerStats.fld
 	CHECKPOINTER_ACC(num_timed);
 	CHECKPOINTER_ACC(num_requested);
+	CHECKPOINTER_ACC(num_performed);
 	CHECKPOINTER_ACC(restartpoints_timed);
 	CHECKPOINTER_ACC(restartpoints_requested);
 	CHECKPOINTER_ACC(restartpoints_performed);
 	CHECKPOINTER_ACC(write_time);
 	CHECKPOINTER_ACC(sync_time);
 	CHECKPOINTER_ACC(buffers_written);
+	CHECKPOINTER_ACC(slru_written);
 #undef CHECKPOINTER_ACC
 
 	pgstat_end_changecount_write(&stats_shmem->changecount);
@@ -82,6 +84,14 @@ pgstat_fetch_stat_checkpointer(void)
 	pgstat_snapshot_fixed(PGSTAT_KIND_CHECKPOINTER);
 
 	return &pgStatLocal.snapshot.checkpointer;
+}
+
+void
+pgstat_checkpointer_init_shmem_cb(void *stats)
+{
+	PgStatShared_Checkpointer *stats_shmem = (PgStatShared_Checkpointer *) stats;
+
+	LWLockInitialize(&stats_shmem->lock, LWTRANCHE_PGSTATS_DATA);
 }
 
 void
@@ -119,11 +129,13 @@ pgstat_checkpointer_snapshot_cb(void)
 #define CHECKPOINTER_COMP(fld) pgStatLocal.snapshot.checkpointer.fld -= reset.fld;
 	CHECKPOINTER_COMP(num_timed);
 	CHECKPOINTER_COMP(num_requested);
+	CHECKPOINTER_COMP(num_performed);
 	CHECKPOINTER_COMP(restartpoints_timed);
 	CHECKPOINTER_COMP(restartpoints_requested);
 	CHECKPOINTER_COMP(restartpoints_performed);
 	CHECKPOINTER_COMP(write_time);
 	CHECKPOINTER_COMP(sync_time);
 	CHECKPOINTER_COMP(buffers_written);
+	CHECKPOINTER_COMP(slru_written);
 #undef CHECKPOINTER_COMP
 }

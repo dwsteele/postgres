@@ -1092,7 +1092,7 @@ test_config_settings(void)
 	 * Probe for max_connections before shared_buffers, since it is subject to
 	 * more constraints than shared_buffers.
 	 */
-	printf(_("selecting default max_connections ... "));
+	printf(_("selecting default \"max_connections\" ... "));
 	fflush(stdout);
 
 	for (i = 0; i < connslen; i++)
@@ -1112,7 +1112,7 @@ test_config_settings(void)
 
 	printf("%d\n", n_connections);
 
-	printf(_("selecting default shared_buffers ... "));
+	printf(_("selecting default \"shared_buffers\" ... "));
 	fflush(stdout);
 
 	for (i = 0; i < bufslen; i++)
@@ -2466,6 +2466,7 @@ usage(const char *progname)
 			 "                            set builtin locale name for new databases\n"));
 	printf(_("      --locale-provider={builtin|libc|icu}\n"
 			 "                            set default locale provider for new databases\n"));
+	printf(_("      --no-data-checksums   do not use data page checksums\n"));
 	printf(_("      --pwfile=FILE         read password for the new superuser from file\n"));
 	printf(_("  -T, --text-search-config=CFG\n"
 			 "                            default text search configuration\n"));
@@ -2481,7 +2482,7 @@ usage(const char *progname)
 	printf(_("  -n, --no-clean            do not clean up after errors\n"));
 	printf(_("  -N, --no-sync             do not wait for changes to be written safely to disk\n"));
 	printf(_("      --no-instructions     do not print instructions for next steps\n"));
-	printf(_("  -s, --show                show internal settings\n"));
+	printf(_("  -s, --show                show internal settings, then exit\n"));
 	printf(_("      --sync-method=METHOD  set method for syncing files to disk\n"));
 	printf(_("  -S, --sync-only           only sync database files to disk, then exit\n"));
 	printf(_("\nOther options:\n"));
@@ -3128,6 +3129,7 @@ main(int argc, char *argv[])
 		{"icu-locale", required_argument, NULL, 17},
 		{"icu-rules", required_argument, NULL, 18},
 		{"sync-method", required_argument, NULL, 19},
+		{"no-data-checksums", no_argument, NULL, 20},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3318,6 +3320,9 @@ main(int argc, char *argv[])
 			case 19:
 				if (!parse_sync_method(optarg, &sync_method))
 					exit(1);
+				break;
+			case 20:
+				data_checksums = false;
 				break;
 			default:
 				/* getopt_long already emitted a complaint */

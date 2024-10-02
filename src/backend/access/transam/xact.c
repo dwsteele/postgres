@@ -38,6 +38,7 @@
 #include "commands/async.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
+#include "commands/waitlsn.h"
 #include "common/pg_prng.h"
 #include "executor/spi.h"
 #include "libpq/be-fsstubs.h"
@@ -200,6 +201,7 @@ typedef struct TransactionStateData
 	int			gucNestLevel;	/* GUC context nesting depth */
 	MemoryContext curTransactionContext;	/* my xact-lifetime context */
 	ResourceOwner curTransactionOwner;	/* my query resources */
+	MemoryContext priorContext; /* CurrentMemoryContext before xact started */
 	TransactionId *childXids;	/* subcommitted child XIDs, in XID order */
 	int			nChildXids;		/* # of subcommitted child XIDs */
 	int			maxChildXids;	/* allocated size of childXids[] */
@@ -646,7 +648,7 @@ AssignTransactionId(TransactionState s)
 	if (IsInParallelMode() || IsParallelWorker())
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				 errmsg("cannot assign XIDs during a parallel operation")));
+				 errmsg("cannot assign transaction IDs during a parallel operation")));
 
 	/*
 	 * Ensure parent(s) have XIDs, so that a child always has an XID later
@@ -1175,6 +1177,11 @@ AtStart_Memory(void)
 	TransactionState s = CurrentTransactionState;
 
 	/*
+	 * Remember the memory context that was active prior to transaction start.
+	 */
+	s->priorContext = CurrentMemoryContext;
+
+	/*
 	 * If this is the first time through, create a private context for
 	 * AbortTransaction to work in.  By reserving some space now, we can
 	 * insulate AbortTransaction from out-of-memory scenarios.  Like
@@ -1190,17 +1197,15 @@ AtStart_Memory(void)
 								  32 * 1024);
 
 	/*
-	 * We shouldn't have a transaction context already.
+	 * Likewise, if this is the first time through, create a top-level context
+	 * for transaction-local data.  This context will be reset at transaction
+	 * end, and then re-used in later transactions.
 	 */
-	Assert(TopTransactionContext == NULL);
-
-	/*
-	 * Create a toplevel context for the transaction.
-	 */
-	TopTransactionContext =
-		AllocSetContextCreate(TopMemoryContext,
-							  "TopTransactionContext",
-							  ALLOCSET_DEFAULT_SIZES);
+	if (TopTransactionContext == NULL)
+		TopTransactionContext =
+			AllocSetContextCreate(TopMemoryContext,
+								  "TopTransactionContext",
+								  ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * In a top-level transaction, CurTransactionContext is the same as
@@ -1250,6 +1255,11 @@ AtSubStart_Memory(void)
 	TransactionState s = CurrentTransactionState;
 
 	Assert(CurTransactionContext != NULL);
+
+	/*
+	 * Remember the context that was active prior to subtransaction start.
+	 */
+	s->priorContext = CurrentMemoryContext;
 
 	/*
 	 * Create a CurTransactionContext, which will be used to hold data that
@@ -1576,20 +1586,30 @@ AtCCI_LocalCache(void)
 static void
 AtCommit_Memory(void)
 {
-	/*
-	 * Now that we're "out" of a transaction, have the system allocate things
-	 * in the top memory context instead of per-transaction contexts.
-	 */
-	MemoryContextSwitchTo(TopMemoryContext);
+	TransactionState s = CurrentTransactionState;
 
 	/*
-	 * Release all transaction-local memory.
+	 * Return to the memory context that was current before we started the
+	 * transaction.  (In principle, this could not be any of the contexts we
+	 * are about to delete.  If it somehow is, assertions in mcxt.c will
+	 * complain.)
+	 */
+	MemoryContextSwitchTo(s->priorContext);
+
+	/*
+	 * Release all transaction-local memory.  TopTransactionContext survives
+	 * but becomes empty; any sub-contexts go away.
 	 */
 	Assert(TopTransactionContext != NULL);
-	MemoryContextDelete(TopTransactionContext);
-	TopTransactionContext = NULL;
+	MemoryContextReset(TopTransactionContext);
+
+	/*
+	 * Clear these pointers as a pro-forma matter.  (Notionally, while
+	 * TopTransactionContext still exists, it's currently not associated with
+	 * this TransactionState struct.)
+	 */
 	CurTransactionContext = NULL;
-	CurrentTransactionState->curTransactionContext = NULL;
+	s->curTransactionContext = NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -1942,13 +1962,18 @@ AtSubAbort_childXids(void)
 static void
 AtCleanup_Memory(void)
 {
-	Assert(CurrentTransactionState->parent == NULL);
+	TransactionState s = CurrentTransactionState;
+
+	/* Should be at top level */
+	Assert(s->parent == NULL);
 
 	/*
-	 * Now that we're "out" of a transaction, have the system allocate things
-	 * in the top memory context instead of per-transaction contexts.
+	 * Return to the memory context that was current before we started the
+	 * transaction.  (In principle, this could not be any of the contexts we
+	 * are about to delete.  If it somehow is, assertions in mcxt.c will
+	 * complain.)
 	 */
-	MemoryContextSwitchTo(TopMemoryContext);
+	MemoryContextSwitchTo(s->priorContext);
 
 	/*
 	 * Clear the special abort context for next time.
@@ -1957,13 +1982,20 @@ AtCleanup_Memory(void)
 		MemoryContextReset(TransactionAbortContext);
 
 	/*
-	 * Release all transaction-local memory.
+	 * Release all transaction-local memory, the same as in AtCommit_Memory,
+	 * except we must cope with the possibility that we didn't get as far as
+	 * creating TopTransactionContext.
 	 */
 	if (TopTransactionContext != NULL)
-		MemoryContextDelete(TopTransactionContext);
-	TopTransactionContext = NULL;
+		MemoryContextReset(TopTransactionContext);
+
+	/*
+	 * Clear these pointers as a pro-forma matter.  (Notionally, while
+	 * TopTransactionContext still exists, it's currently not associated with
+	 * this TransactionState struct.)
+	 */
 	CurTransactionContext = NULL;
-	CurrentTransactionState->curTransactionContext = NULL;
+	s->curTransactionContext = NULL;
 }
 
 
@@ -1982,8 +2014,15 @@ AtSubCleanup_Memory(void)
 
 	Assert(s->parent != NULL);
 
-	/* Make sure we're not in an about-to-be-deleted context */
-	MemoryContextSwitchTo(s->parent->curTransactionContext);
+	/*
+	 * Return to the memory context that was current before we started the
+	 * subtransaction.  (In principle, this could not be any of the contexts
+	 * we are about to delete.  If it somehow is, assertions in mcxt.c will
+	 * complain.)
+	 */
+	MemoryContextSwitchTo(s->priorContext);
+
+	/* Update CurTransactionContext (might not be same as priorContext) */
 	CurTransactionContext = s->parent->curTransactionContext;
 
 	/*
@@ -2770,6 +2809,11 @@ AbortTransaction(void)
 	 * while cleaning up!
 	 */
 	LWLockReleaseAll();
+
+	/*
+	 * Cleanup waiting for LSN if any.
+	 */
+	WaitLSNCleanup();
 
 	/* Clear wait information and command progress indicator */
 	pgstat_report_wait_end();
@@ -4904,8 +4948,13 @@ AbortOutOfAnyTransaction(void)
 	/* Should be out of all subxacts now */
 	Assert(s->parent == NULL);
 
-	/* If we didn't actually have anything to do, revert to TopMemoryContext */
-	AtCleanup_Memory();
+	/*
+	 * Revert to TopMemoryContext, to ensure we exit in a well-defined state
+	 * whether there were any transactions to close or not.  (Callers that
+	 * don't intend to exit soon should switch to some other context to avoid
+	 * long-term memory leaks.)
+	 */
+	MemoryContextSwitchTo(TopMemoryContext);
 }
 
 /*
@@ -5279,20 +5328,7 @@ AbortSubTransaction(void)
 
 		AtEOSubXact_RelationCache(false, s->subTransactionId,
 								  s->parent->subTransactionId);
-
-
-		/*
-		 * AtEOSubXact_Inval sometimes needs to temporarily bump the refcount
-		 * on the relcache entries that it processes.  We cannot use the
-		 * subtransaction's resource owner anymore, because we've already
-		 * started releasing it.  But we can use the parent resource owner.
-		 */
-		CurrentResourceOwner = s->parent->curTransactionOwner;
-
 		AtEOSubXact_Inval(false);
-
-		CurrentResourceOwner = s->curTransactionOwner;
-
 		ResourceOwnerRelease(s->curTransactionOwner,
 							 RESOURCE_RELEASE_LOCKS,
 							 false, false);
@@ -5915,7 +5951,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 	{
 		XLogRegisterData((char *) (&xl_twophase), sizeof(xl_xact_twophase));
 		if (xl_xinfo.xinfo & XACT_XINFO_HAS_GID)
-			XLogRegisterData(unconstify(char *, twophase_gid), strlen(twophase_gid) + 1);
+			XLogRegisterData(twophase_gid, strlen(twophase_gid) + 1);
 	}
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)
@@ -6061,7 +6097,7 @@ XactLogAbortRecord(TimestampTz abort_time,
 	{
 		XLogRegisterData((char *) (&xl_twophase), sizeof(xl_xact_twophase));
 		if (xl_xinfo.xinfo & XACT_XINFO_HAS_GID)
-			XLogRegisterData(unconstify(char *, twophase_gid), strlen(twophase_gid) + 1);
+			XLogRegisterData(twophase_gid, strlen(twophase_gid) + 1);
 	}
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)

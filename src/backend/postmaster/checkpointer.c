@@ -442,7 +442,7 @@ CheckpointerMain(char *startup_data, size_t startup_data_len)
 									   "checkpoints are occurring too frequently (%d seconds apart)",
 									   elapsed_secs,
 									   elapsed_secs),
-						 errhint("Consider increasing the configuration parameter max_wal_size.")));
+						 errhint("Consider increasing the configuration parameter \"%s\".", "max_wal_size")));
 
 			/*
 			 * Initialize checkpointer-private variables used during
@@ -460,10 +460,7 @@ CheckpointerMain(char *startup_data, size_t startup_data_len)
 			 * Do the checkpoint.
 			 */
 			if (!do_restartpoint)
-			{
-				CreateCheckPoint(flags);
-				ckpt_performed = true;
-			}
+				ckpt_performed = CreateCheckPoint(flags);
 			else
 				ckpt_performed = CreateRestartPoint(flags);
 
@@ -484,7 +481,7 @@ CheckpointerMain(char *startup_data, size_t startup_data_len)
 
 			ConditionVariableBroadcast(&CheckpointerShmem->done_cv);
 
-			if (ckpt_performed)
+			if (!do_restartpoint)
 			{
 				/*
 				 * Note we record the checkpoint start time not end time as
@@ -493,18 +490,32 @@ CheckpointerMain(char *startup_data, size_t startup_data_len)
 				 */
 				last_checkpoint_time = now;
 
-				if (do_restartpoint)
-					PendingCheckpointerStats.restartpoints_performed++;
+				if (ckpt_performed)
+					PendingCheckpointerStats.num_performed++;
 			}
 			else
 			{
-				/*
-				 * We were not able to perform the restartpoint (checkpoints
-				 * throw an ERROR in case of error).  Most likely because we
-				 * have not received any new checkpoint WAL records since the
-				 * last restartpoint. Try again in 15 s.
-				 */
-				last_checkpoint_time = now - CheckPointTimeout + 15;
+				if (ckpt_performed)
+				{
+					/*
+					 * The same as for checkpoint. Please see the
+					 * corresponding comment.
+					 */
+					last_checkpoint_time = now;
+
+					PendingCheckpointerStats.restartpoints_performed++;
+				}
+				else
+				{
+					/*
+					 * We were not able to perform the restartpoint
+					 * (checkpoints throw an ERROR in case of error).  Most
+					 * likely because we have not received any new checkpoint
+					 * WAL records since the last restartpoint. Try again in
+					 * 15 s.
+					 */
+					last_checkpoint_time = now - CheckPointTimeout + 15;
+				}
 			}
 
 			ckpt_active = false;
@@ -663,7 +674,7 @@ CheckArchiveTimeout(void)
 			 * assume nothing happened.
 			 */
 			if (XLogSegmentOffset(switchpoint, wal_segment_size) != 0)
-				elog(DEBUG1, "write-ahead log switch forced (archive_timeout=%d)",
+				elog(DEBUG1, "write-ahead log switch forced (\"archive_timeout\"=%d)",
 					 XLogArchiveTimeout);
 		}
 
@@ -1168,6 +1179,10 @@ CompactCheckpointerRequestQueue(void)
 
 	/* must hold CheckpointerCommLock in exclusive mode */
 	Assert(LWLockHeldByMe(CheckpointerCommLock));
+
+	/* Avoid memory allocations in a critical section. */
+	if (CritSectionCount > 0)
+		return false;
 
 	/* Initialize skip_slot array */
 	skip_slot = palloc0(sizeof(bool) * CheckpointerShmem->num_requests);

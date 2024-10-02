@@ -50,6 +50,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pwd.h>
 #endif
 
 #ifdef WIN32
@@ -947,7 +948,7 @@ fillPGconn(PGconn *conn, PQconninfoOption *connOptions)
  * Copy over option values from srcConn to dstConn
  *
  * Don't put anything cute here --- intelligence should be in
- * connectOptions2 ...
+ * pqConnectOptions2 ...
  *
  * Returns true on success. On failure, returns false and sets error message of
  * dstConn.
@@ -1602,8 +1603,8 @@ pqConnectOptions2(PGconn *conn)
 		if (conn->sslnegotiation[0] != 'p')
 		{
 			conn->status = CONNECTION_BAD;
-			libpq_append_conn_error(conn, "sslnegotiation value \"%s\" invalid when SSL support is not compiled in",
-									conn->sslnegotiation);
+			libpq_append_conn_error(conn, "%s value \"%s\" invalid when SSL support is not compiled in",
+									"sslnegotiation", conn->sslnegotiation);
 			return false;
 		}
 #endif
@@ -1657,7 +1658,7 @@ pqConnectOptions2(PGconn *conn)
 	if (!sslVerifyProtocolVersion(conn->ssl_min_protocol_version))
 	{
 		conn->status = CONNECTION_BAD;
-		libpq_append_conn_error(conn, "invalid %s value: \"%s\"",
+		libpq_append_conn_error(conn, "invalid \"%s\" value: \"%s\"",
 								"ssl_min_protocol_version",
 								conn->ssl_min_protocol_version);
 		return false;
@@ -1665,7 +1666,7 @@ pqConnectOptions2(PGconn *conn)
 	if (!sslVerifyProtocolVersion(conn->ssl_max_protocol_version))
 	{
 		conn->status = CONNECTION_BAD;
-		libpq_append_conn_error(conn, "invalid %s value: \"%s\"",
+		libpq_append_conn_error(conn, "invalid \"%s\" value: \"%s\"",
 								"ssl_max_protocol_version",
 								conn->ssl_max_protocol_version);
 		return false;
@@ -2470,7 +2471,7 @@ int
 pqConnectDBComplete(PGconn *conn)
 {
 	PostgresPollingStatusType flag = PGRES_POLLING_WRITING;
-	time_t		finish_time = ((time_t) -1);
+	pg_usec_time_t end_time = -1;
 	int			timeout = 0;
 	int			last_whichhost = -2;	/* certainly different from whichhost */
 	int			last_whichaddr = -2;	/* certainly different from whichaddr */
@@ -2479,7 +2480,7 @@ pqConnectDBComplete(PGconn *conn)
 		return 0;
 
 	/*
-	 * Set up a time limit, if connect_timeout isn't zero.
+	 * Set up a time limit, if connect_timeout is greater than zero.
 	 */
 	if (conn->connect_timeout != NULL)
 	{
@@ -2490,19 +2491,6 @@ pqConnectDBComplete(PGconn *conn)
 			conn->status = CONNECTION_BAD;
 			return 0;
 		}
-
-		if (timeout > 0)
-		{
-			/*
-			 * Rounding could cause connection to fail unexpectedly quickly;
-			 * to prevent possibly waiting hardly-at-all, insist on at least
-			 * two seconds.
-			 */
-			if (timeout < 2)
-				timeout = 2;
-		}
-		else					/* negative means 0 */
-			timeout = 0;
 	}
 
 	for (;;)
@@ -2519,7 +2507,7 @@ pqConnectDBComplete(PGconn *conn)
 			(conn->whichhost != last_whichhost ||
 			 conn->whichaddr != last_whichaddr))
 		{
-			finish_time = time(NULL) + timeout;
+			end_time = PQgetCurrentTimeUSec() + (pg_usec_time_t) timeout * 1000000;
 			last_whichhost = conn->whichhost;
 			last_whichaddr = conn->whichaddr;
 		}
@@ -2534,7 +2522,7 @@ pqConnectDBComplete(PGconn *conn)
 				return 1;		/* success! */
 
 			case PGRES_POLLING_READING:
-				ret = pqWaitTimed(1, 0, conn, finish_time);
+				ret = pqWaitTimed(1, 0, conn, end_time);
 				if (ret == -1)
 				{
 					/* hard failure, eg select() problem, aborts everything */
@@ -2544,7 +2532,7 @@ pqConnectDBComplete(PGconn *conn)
 				break;
 
 			case PGRES_POLLING_WRITING:
-				ret = pqWaitTimed(0, 1, conn, finish_time);
+				ret = pqWaitTimed(0, 1, conn, end_time);
 				if (ret == -1)
 				{
 					/* hard failure, eg select() problem, aborts everything */
@@ -3355,16 +3343,6 @@ keep_going:						/* We will come back to here until there is
 #ifdef USE_SSL
 
 				/*
-				 * Enable the libcrypto callbacks before checking if SSL needs
-				 * to be done.  This is done before sending the startup packet
-				 * as depending on the type of authentication done, like MD5
-				 * or SCRAM that use cryptohashes, the callbacks would be
-				 * required even without a SSL connection
-				 */
-				if (pqsecure_initialize(conn, false, true) < 0)
-					goto error_return;
-
-				/*
 				 * If SSL is enabled, start the SSL negotiation. We will come
 				 * back here after SSL encryption has been established, with
 				 * ssl_in_use set.
@@ -3506,11 +3484,17 @@ keep_going:						/* We will come back to here until there is
 					}
 					if (SSLok == 'S')
 					{
+						if (conn->Pfdebug)
+							pqTraceOutputCharResponse(conn, "SSLResponse",
+													  SSLok);
 						/* mark byte consumed */
 						conn->inStart = conn->inCursor;
 					}
 					else if (SSLok == 'N')
 					{
+						if (conn->Pfdebug)
+							pqTraceOutputCharResponse(conn, "SSLResponse",
+													  SSLok);
 						/* mark byte consumed */
 						conn->inStart = conn->inCursor;
 
@@ -3519,7 +3503,7 @@ keep_going:						/* We will come back to here until there is
 						 * continue without SSL, we can proceed using this
 						 * connection.  Otherwise return with an error.
 						 */
-						ENCRYPTION_NEGOTIATION_FAILED("server does not support SSL, but SSL was required");
+						ENCRYPTION_NEGOTIATION_FAILED(libpq_gettext("server does not support SSL, but SSL was required"));
 					}
 					else if (SSLok == 'E')
 					{
@@ -3534,6 +3518,12 @@ keep_going:						/* We will come back to here until there is
 						 * byte here.
 						 */
 						conn->status = CONNECTION_AWAITING_RESPONSE;
+
+						/*
+						 * Don't fall back to a plaintext connection after
+						 * reading the error.
+						 */
+						conn->failed_enc_methods |= conn->allowed_enc_methods & (~conn->current_enc_method);
 						goto keep_going;
 					}
 					else
@@ -3543,14 +3533,6 @@ keep_going:						/* We will come back to here until there is
 						goto error_return;
 					}
 				}
-
-				/*
-				 * Set up global SSL state if required.  The crypto state has
-				 * already been set if libpq took care of doing that, so there
-				 * is no need to make that happen again.
-				 */
-				if (pqsecure_initialize(conn, true, false) != 0)
-					goto error_return;
 
 				/*
 				 * Begin or continue the SSL negotiation process.
@@ -3577,8 +3559,8 @@ keep_going:						/* We will come back to here until there is
 				if (pollres == PGRES_POLLING_FAILED)
 				{
 					/*
-					 * Failed direct ssl connection, possibly try a new
-					 * connection with postgres negotiation
+					 * SSL handshake failed.  We will retry with a plaintext
+					 * connection, if permitted by sslmode.
 					 */
 					CONNECTION_FAILED();
 				}
@@ -3625,6 +3607,13 @@ keep_going:						/* We will come back to here until there is
 						 * into AWAITING_RESPONSE state and let the code there
 						 * deal with it.  Note we have *not* consumed the "E"
 						 * byte here.
+						 *
+						 * Note that unlike on an error response to
+						 * SSLRequest, we allow falling back to SSL or
+						 * plaintext connection here.  GSS support was
+						 * introduced in PostgreSQL version 12, so an error
+						 * response might mean that we are connecting to a
+						 * pre-v12 server.
 						 */
 						conn->status = CONNECTION_AWAITING_RESPONSE;
 						goto keep_going;
@@ -3635,12 +3624,16 @@ keep_going:						/* We will come back to here until there is
 
 					if (gss_ok == 'N')
 					{
+						if (conn->Pfdebug)
+							pqTraceOutputCharResponse(conn, "GSSENCResponse",
+													  gss_ok);
+
 						/*
 						 * The connection is still valid, so if it's OK to
 						 * continue without GSS, we can proceed using this
 						 * connection.  Otherwise return with an error.
 						 */
-						ENCRYPTION_NEGOTIATION_FAILED("server doesn't support GSSAPI encryption, but it was required");
+						ENCRYPTION_NEGOTIATION_FAILED(libpq_gettext("server doesn't support GSSAPI encryption, but it was required"));
 					}
 					else if (gss_ok != 'G')
 					{
@@ -3648,6 +3641,10 @@ keep_going:						/* We will come back to here until there is
 												gss_ok);
 						goto error_return;
 					}
+
+					if (conn->Pfdebug)
+						pqTraceOutputCharResponse(conn, "GSSENCResponse",
+												  gss_ok);
 				}
 
 				/* Begin or continue GSSAPI negotiation */
@@ -3672,6 +3669,10 @@ keep_going:						/* We will come back to here until there is
 				}
 				else if (pollres == PGRES_POLLING_FAILED)
 				{
+					/*
+					 * GSS handshake failed.  We will retry with an SSL or
+					 * plaintext connection, if permitted by the options.
+					 */
 					CONNECTION_FAILED();
 				}
 				/* Else, return POLLING_READING or POLLING_WRITING status */
@@ -3779,7 +3780,7 @@ keep_going:						/* We will come back to here until there is
 						return PGRES_POLLING_READING;
 					}
 					/* OK, we read the message; mark data consumed */
-					conn->inStart = conn->inCursor;
+					pqParseDone(conn, conn->inCursor);
 
 					/*
 					 * Before 7.2, the postmaster didn't always end its
@@ -3829,7 +3830,7 @@ keep_going:						/* We will come back to here until there is
 						goto error_return;
 					}
 					/* OK, we read the message; mark data consumed */
-					conn->inStart = conn->inCursor;
+					pqParseDone(conn, conn->inCursor);
 
 					/*
 					 * If error is "cannot connect now", try the next host if
@@ -3858,7 +3859,7 @@ keep_going:						/* We will come back to here until there is
 						goto error_return;
 					}
 					/* OK, we read the message; mark data consumed */
-					conn->inStart = conn->inCursor;
+					pqParseDone(conn, conn->inCursor);
 					goto error_return;
 				}
 
@@ -3883,7 +3884,11 @@ keep_going:						/* We will come back to here until there is
 				 */
 				res = pg_fe_sendauth(areq, msgLength, conn);
 
-				/* OK, we have processed the message; mark data consumed */
+				/*
+				 * OK, we have processed the message; mark data consumed.  We
+				 * don't call pqParseDone here because we already traced this
+				 * message inside pg_fe_sendauth.
+				 */
 				conn->inStart = conn->inCursor;
 
 				if (res != STATUS_OK)
@@ -4312,7 +4317,7 @@ init_allowed_encryption_methods(PGconn *conn)
 		if (conn->gssencmode[0] == 'r')
 		{
 			libpq_append_conn_error(conn,
-									"GSSAPI encryption required but it is not supported over a local socket)");
+									"GSSAPI encryption required but it is not supported over a local socket");
 			conn->allowed_enc_methods = 0;
 			conn->current_enc_method = ENC_ERROR;
 			return false;
@@ -7154,6 +7159,16 @@ PQprotocolVersion(const PGconn *conn)
 }
 
 int
+PQfullProtocolVersion(const PGconn *conn)
+{
+	if (!conn)
+		return 0;
+	if (conn->status == CONNECTION_BAD)
+		return 0;
+	return PG_PROTOCOL_FULL(conn->pversion);
+}
+
+int
 PQserverVersion(const PGconn *conn)
 {
 	if (!conn)
@@ -7434,7 +7449,9 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 				 const char *username, const char *pgpassfile)
 {
 	FILE	   *fp;
+#ifndef WIN32
 	struct stat stat_buf;
+#endif
 	PQExpBufferData buf;
 
 	if (dbname == NULL || dbname[0] == '\0')
@@ -7459,15 +7476,23 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 		port = DEF_PGPORT_STR;
 
 	/* If password file cannot be opened, ignore it. */
-	if (stat(pgpassfile, &stat_buf) != 0)
+	fp = fopen(pgpassfile, "r");
+	if (fp == NULL)
 		return NULL;
 
 #ifndef WIN32
+	if (fstat(fileno(fp), &stat_buf) != 0)
+	{
+		fclose(fp);
+		return NULL;
+	}
+
 	if (!S_ISREG(stat_buf.st_mode))
 	{
 		fprintf(stderr,
 				libpq_gettext("WARNING: password file \"%s\" is not a plain file\n"),
 				pgpassfile);
+		fclose(fp);
 		return NULL;
 	}
 
@@ -7477,6 +7502,7 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 		fprintf(stderr,
 				libpq_gettext("WARNING: password file \"%s\" has group or world access; permissions should be u=rw (0600) or less\n"),
 				pgpassfile);
+		fclose(fp);
 		return NULL;
 	}
 #else
@@ -7486,10 +7512,6 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 	 * file.
 	 */
 #endif
-
-	fp = fopen(pgpassfile, "r");
-	if (fp == NULL)
-		return NULL;
 
 	/* Use an expansible buffer to accommodate any reasonable line length */
 	initPQExpBuffer(&buf);
@@ -7678,10 +7700,24 @@ pqGetHomeDirectory(char *buf, int bufsize)
 	const char *home;
 
 	home = getenv("HOME");
-	if (home == NULL || home[0] == '\0')
-		return pg_get_user_home_dir(geteuid(), buf, bufsize);
-	strlcpy(buf, home, bufsize);
-	return true;
+	if (home && home[0])
+	{
+		strlcpy(buf, home, bufsize);
+		return true;
+	}
+	else
+	{
+		struct passwd pwbuf;
+		struct passwd *pw;
+		char		tmpbuf[1024];
+		int			rc;
+
+		rc = getpwuid_r(geteuid(), &pwbuf, tmpbuf, sizeof tmpbuf, &pw);
+		if (rc != 0 || !pw)
+			return false;
+		strlcpy(buf, pw->pw_dir, bufsize);
+		return true;
+	}
 #else
 	char		tmppath[MAX_PATH];
 

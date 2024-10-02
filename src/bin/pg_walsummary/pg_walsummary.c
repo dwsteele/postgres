@@ -71,7 +71,7 @@ main(int argc, char *argv[])
 	handle_help_version_opts(argc, argv, progname, help);
 
 	/* process command-line options */
-	while ((c = getopt_long(argc, argv, "f:iqw:",
+	while ((c = getopt_long(argc, argv, "iq",
 							long_options, &optindex)) != -1)
 	{
 		switch (c)
@@ -91,7 +91,7 @@ main(int argc, char *argv[])
 
 	if (optind >= argc)
 	{
-		pg_log_error("%s: no input files specified", progname);
+		pg_log_error("no input files specified");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
