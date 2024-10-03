@@ -116,10 +116,10 @@ pg_backup_start(PG_FUNCTION_ARGS)
  * The backup_label contains the user-supplied label string (typically this
  * would be used to tell where the backup dump will be stored), the starting
  * time, starting WAL location for the dump and so on.  The pg_control file
- * contains represents a consistent copy of pg_control that also has a safeguard
- * against being used without backup_label.  It is the caller's responsibility
- * to write the backup_label, pg_control, and tablespace_map files in the data
- * folder that will be restored from this backup.
+ * contains a consistent copy of pg_control that also has a safeguard against
+ * being used without backup_label.  It is the caller's responsibility to write
+ * the backup_label, pg_control, and tablespace_map files in the data folder
+ * that will be restored from this backup.
  *
  * Permission checking for this function is managed through the normal
  * GRANT system.
