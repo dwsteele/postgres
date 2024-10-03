@@ -9110,9 +9110,7 @@ get_backup_status(void)
  * wait for WAL segments to be archived.
  *
  * "state" is filled with the information necessary to restore from this
- * backup with its stop LSN (stoppoint), its timeline ID (stoptli), etc. This
- * includes a copy of pg_control with safeguards against it being used without
- * backup_label.
+ * backup with its stop LSN (stoppoint), its timeline ID (stoptli), etc.
  *
  * It is the responsibility of the caller of this function to verify the
  * permissions of the calling user!
@@ -9129,29 +9127,10 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 	int			seconds_before_warning;
 	int			waits = 0;
 	bool		reported_waiting = false;
-	ControlFileData *controlFileCopy = (ControlFileData *)state->controlFile;
 
 	Assert(state != NULL);
 
 	backup_stopped_in_recovery = RecoveryInProgress();
-
-	/*
-	 * Create a copy of control data and update it to require a backup label
-	 * for recovery. Also recalculate the CRC.
-	 */
-	memset(
-		state->controlFile + sizeof(ControlFileData), 0,
-		PG_CONTROL_FILE_SIZE - sizeof(ControlFileData));
-
-	LWLockAcquire(ControlFileLock, LW_SHARED);
-	memcpy(controlFileCopy, ControlFile, sizeof(ControlFileData));
-	LWLockRelease(ControlFileLock);
-
-	controlFileCopy->backupLabelRequired = true;
-
-	INIT_CRC32C(controlFileCopy->crc);
-	COMP_CRC32C(controlFileCopy->crc, controlFileCopy, offsetof(ControlFileData, crc));
-	FIN_CRC32C(controlFileCopy->crc);
 
 	/*
 	 * During recovery, we don't need to check WAL level. Because, if WAL
@@ -9431,6 +9410,29 @@ do_pg_abort_backup(int code, Datum arg)
 			ereport(WARNING,
 					errmsg("aborting backup due to backend exiting before pg_backup_stop was called"));
 	}
+}
+
+/*
+ * Create a consistent copy of control data to be used for backup and update it
+ * to require a backup label for recovery. Also recalculate the CRC.
+ */
+void
+backup_control_file(uint8_t *controlFile)
+{
+	ControlFileData *controlData = ((ControlFileData *)controlFile);
+
+	memset(controlFile + sizeof(ControlFileData), 0,
+		   PG_CONTROL_FILE_SIZE - sizeof(ControlFileData));
+
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	memcpy(controlFile, ControlFile, sizeof(ControlFileData));
+	LWLockRelease(ControlFileLock);
+
+	controlData->backupLabelRequired = true;
+
+	INIT_CRC32C(controlData->crc);
+	COMP_CRC32C(controlData->crc, controlFile, offsetof(ControlFileData, crc));
+	FIN_CRC32C(controlData->crc);
 }
 
 /*

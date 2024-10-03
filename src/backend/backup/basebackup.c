@@ -23,6 +23,7 @@
 #include "backup/basebackup_incremental.h"
 #include "backup/basebackup_sink.h"
 #include "backup/basebackup_target.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "commands/defrem.h"
 #include "common/compression.h"
@@ -327,6 +328,7 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 			{
 				bool		sendtblspclinks = true;
 				char	   *backup_label;
+				uint8_t controlFile[PG_CONTROL_FILE_SIZE];
 
 				bbsink_begin_archive(sink, "base.tar");
 
@@ -347,6 +349,12 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 				/* Then the bulk of the files... */
 				sendDir(sink, ".", 1, false, state.tablespaces,
 						sendtblspclinks, &manifest, InvalidOid, ib);
+
+				/* ... and pg_control after everything else. */
+				backup_control_file(controlFile);
+				sendFileWithContent(sink, XLOG_CONTROL_FILE,
+									(char *)controlFile, PG_CONTROL_FILE_SIZE,
+									&manifest);
 			}
 			else
 			{
@@ -363,7 +371,7 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 			 * include the xlog files below and stop afterwards. This is safe
 			 * since the main data directory is always sent *last*.
 			 */
-			if (ti->path == NULL)
+			if (opt->includewal && ti->path == NULL)
 			{
 				Assert(lnext(state.tablespaces, lc) == NULL);
 			}
@@ -382,11 +390,6 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 
 		basebackup_progress_wait_wal_archive(&state);
 		do_pg_backup_stop(backup_state, !opt->nowait);
-
-		/* Send pg_control */
-		sendFileWithContent(sink, XLOG_CONTROL_FILE,
-							(char *)backup_state->controlFile,
-							PG_CONTROL_FILE_SIZE, &manifest);
 
 		endptr = backup_state->stoppoint;
 		endtli = backup_state->stoptli;
@@ -626,16 +629,16 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 			StatusFilePath(pathbuf, fname, ".done");
 			sendFileWithContent(sink, pathbuf, "", -1, &manifest);
 		}
+
+		/* Properly terminate the tar file. */
+		StaticAssertStmt(2 * TAR_BLOCK_SIZE <= BLCKSZ,
+						 "BLCKSZ too small for 2 tar blocks");
+		memset(sink->bbs_buffer, 0, 2 * TAR_BLOCK_SIZE);
+		bbsink_archive_contents(sink, 2 * TAR_BLOCK_SIZE);
+
+		/* OK, that's the end of the archive. */
+		bbsink_end_archive(sink);
 	}
-
-	/* Properly terminate the tar file. */
-	StaticAssertStmt(2 * TAR_BLOCK_SIZE <= BLCKSZ,
-						"BLCKSZ too small for 2 tar blocks");
-	memset(sink->bbs_buffer, 0, 2 * TAR_BLOCK_SIZE);
-	bbsink_archive_contents(sink, 2 * TAR_BLOCK_SIZE);
-
-	/* OK, that's the end of the archive. */
-	bbsink_end_archive(sink);
 
 	AddWALInfoToBackupManifest(&manifest, state.startptr, state.starttli,
 							   endptr, endtli);

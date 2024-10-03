@@ -158,7 +158,7 @@ pg_backup_stop(PG_FUNCTION_ARGS)
 	/* Build the contents of pg_control */
 	pg_control_bytea = (bytea *) palloc(PG_CONTROL_FILE_SIZE + VARHDRSZ);
 	SET_VARSIZE(pg_control_bytea, PG_CONTROL_FILE_SIZE + VARHDRSZ);
-	memcpy(VARDATA(pg_control_bytea), backup_state->controlFile, PG_CONTROL_FILE_SIZE);
+	backup_control_file((uint8_t *)VARDATA(pg_control_bytea));
 
 	values[0] = LSNGetDatum(backup_state->stoppoint);
 	values[1] = CStringGetTextDatum(backup_label);
