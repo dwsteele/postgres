@@ -49,6 +49,31 @@ on_failure_meson: &on_failure_meson
     path: "build*/meson-logs/*.txt"
     type: text/plain
 
+# configure feature flags, shared between the task running the linux tests and
+# the CompilerWarnings task
+LINUX_CONFIGURE_FEATURES: &LINUX_CONFIGURE_FEATURES >-
+  --with-gssapi
+  --with-icu
+  --with-ldap
+  --with-libxml
+  --with-libxslt
+  --with-llvm
+  --with-lz4
+  --with-pam
+  --with-perl
+  --with-python
+  --with-selinux
+  --with-ssl=openssl
+  --with-systemd
+  --with-tcl --with-tclconfig=/usr/lib/tcl8.6/
+  --with-uuid=ossp
+  --with-zstd
+
+LINUX_MESON_FEATURES: &LINUX_MESON_FEATURES >-
+  -Dllvm=enabled
+  -Duuid=e2fs
+
+
 task:
   env:
     CPUS: 4
@@ -91,6 +116,7 @@ task:
 
   <<: *linux_task_template
 
+  depends_on: SanityCheck
   only_if: $CIRRUS_CHANGE_MESSAGE !=~ '.*\nci-os-only:.*' || $CIRRUS_CHANGE_MESSAGE =~ '.*\nci-os-only:[^\n]*linux.*'
 
   ccache_cache:
