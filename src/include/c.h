@@ -175,6 +175,18 @@
 #endif
 
 /*
+ * pg_attribute_target allows specifying different target options that the
+ * function should be compiled with (e.g., for using special CPU instructions).
+ * Note that there still needs to be a configure-time check to verify that a
+ * specific target is understood by the compiler.
+ */
+#if __has_attribute (target)
+#define pg_attribute_target(...) __attribute__((target(__VA_ARGS__)))
+#else
+#define pg_attribute_target(...)
+#endif
+
+/*
  * Append PG_USED_FOR_ASSERTS_ONLY to definitions of variables that are only
  * used in assert-enabled builds, to avoid compiler warnings about unused
  * variables in assert-disabled builds.
@@ -491,11 +503,9 @@ typedef char *Pointer;
  *		used for numerical computations and the
  *		frontend/backend protocol.
  */
-#ifndef HAVE_INT8
 typedef signed char int8;		/* == 8 bits */
 typedef signed short int16;		/* == 16 bits */
 typedef signed int int32;		/* == 32 bits */
-#endif							/* not HAVE_INT8 */
 
 /*
  * uintN
@@ -503,11 +513,9 @@ typedef signed int int32;		/* == 32 bits */
  *		used for numerical computations and the
  *		frontend/backend protocol.
  */
-#ifndef HAVE_UINT8
 typedef unsigned char uint8;	/* == 8 bits */
 typedef unsigned short uint16;	/* == 16 bits */
 typedef unsigned int uint32;	/* == 32 bits */
-#endif							/* not HAVE_UINT8 */
 
 /*
  * bitsN
@@ -523,23 +531,15 @@ typedef uint32 bits32;			/* >= 32 bits */
 #ifdef HAVE_LONG_INT_64
 /* Plain "long int" fits, use it */
 
-#ifndef HAVE_INT64
 typedef long int int64;
-#endif
-#ifndef HAVE_UINT64
 typedef unsigned long int uint64;
-#endif
 #define INT64CONST(x)  (x##L)
 #define UINT64CONST(x) (x##UL)
 #elif defined(HAVE_LONG_LONG_INT_64)
 /* We have working support for "long long int", use that */
 
-#ifndef HAVE_INT64
 typedef long long int int64;
-#endif
-#ifndef HAVE_UINT64
 typedef unsigned long long int uint64;
-#endif
 #define INT64CONST(x)  (x##LL)
 #define UINT64CONST(x) (x##ULL)
 #else

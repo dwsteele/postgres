@@ -52,6 +52,7 @@
 #include "miscadmin.h"
 #include "nodes/queryjumble.h"
 #include "parser/parse_relation.h"
+#include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
@@ -70,18 +71,6 @@ ExecutorEnd_hook_type ExecutorEnd_hook = NULL;
 
 /* Hook for plugin to get control in ExecCheckPermissions() */
 ExecutorCheckPerms_hook_type ExecutorCheckPerms_hook = NULL;
-
-/*
- * Check that the query ID is set, which is something that happens only
- * if compute_query_id is enabled (or a module forced it), if track_activities
- * is enabled, and if a client provided a query string to map with the query
- * ID computed from it.
- */
-#define EXEC_CHECK_QUERY_ID \
-do { \
-	Assert(!IsQueryIdEnabled() || !pgstat_track_activities ||		\
-		   !debug_query_string || pgstat_get_my_query_id() != 0);	\
-} while(0)
 
 /* decls for local routines only used within this module */
 static void InitPlan(QueryDesc *queryDesc, int eflags);
@@ -308,9 +297,6 @@ ExecutorRun(QueryDesc *queryDesc,
 			ScanDirection direction, uint64 count,
 			bool execute_once)
 {
-	/* If enabled, the query ID should be set. */
-	EXEC_CHECK_QUERY_ID;
-
 	if (ExecutorRun_hook)
 		(*ExecutorRun_hook) (queryDesc, direction, count, execute_once);
 	else
@@ -419,9 +405,6 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 void
 ExecutorFinish(QueryDesc *queryDesc)
 {
-	/* If enabled, the query ID should be set. */
-	EXEC_CHECK_QUERY_ID;
-
 	if (ExecutorFinish_hook)
 		(*ExecutorFinish_hook) (queryDesc);
 	else
@@ -482,9 +465,6 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 void
 ExecutorEnd(QueryDesc *queryDesc)
 {
-	/* If enabled, the query ID should be set. */
-	EXEC_CHECK_QUERY_ID;
-
 	if (ExecutorEnd_hook)
 		(*ExecutorEnd_hook) (queryDesc);
 	else
@@ -503,6 +483,10 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	estate = queryDesc->estate;
 
 	Assert(estate != NULL);
+
+	if (estate->es_parallel_workers_to_launch > 0)
+		pgstat_update_parallel_workers_stats((PgStat_Counter) estate->es_parallel_workers_to_launch,
+											 (PgStat_Counter) estate->es_parallel_workers_launched);
 
 	/*
 	 * Check that ExecutorFinish was called, unless in EXPLAIN-only mode. This
