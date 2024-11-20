@@ -116,7 +116,6 @@ task:
 
   <<: *linux_task_template
 
-  depends_on: SanityCheck
   only_if: $CIRRUS_CHANGE_MESSAGE !=~ '.*\nci-os-only:.*' || $CIRRUS_CHANGE_MESSAGE =~ '.*\nci-os-only:[^\n]*linux.*'
 
   ccache_cache:
