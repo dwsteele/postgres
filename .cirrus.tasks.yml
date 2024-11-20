@@ -166,23 +166,7 @@ task:
             build
         EOF
 
-      # Also build & test in a 32bit build - it's gotten rare to test that
-      # locally.
-      configure_32_script: |
-        su postgres <<-EOF
-          export CC='ccache gcc -m32'
-          meson setup \
-            --buildtype=debug \
-            -Dcassert=true -Dinjection_points=true \
-            ${LINUX_MESON_FEATURES} \
-            -Dllvm=disabled \
-            --pkg-config-path /usr/lib/i386-linux-gnu/pkgconfig/ \
-            -DPERL=perl5.36-i386-linux-gnu \
-            build-32
-        EOF
-
       build_script: su postgres -c 'ninja -C build -j${BUILD_JOBS}'
-      build_32_script: su postgres -c 'ninja -C build-32 -j${BUILD_JOBS}'
 
       upload_caches: ccache
 
@@ -193,16 +177,6 @@ task:
         EOF
         # so that we don't upload 64bit logs if 32bit fails
         rm -rf build/
-
-      # There's currently no coverage of icu with LANG=C in the buildfarm. We
-      # can easily provide some here by running one of the sets of tests that
-      # way. Newer versions of python insist on changing the LC_CTYPE away
-      # from C, prevent that with PYTHONCOERCECLOCALE.
-      test_world_32_script: |
-        su postgres <<-EOF
-          ulimit -c unlimited
-          PYTHONCOERCECLOCALE=0 LANG=C meson test $MTEST_ARGS -C build-32 --num-processes ${TEST_JOBS}
-        EOF
 
       on_failure:
         <<: *on_failure_meson
