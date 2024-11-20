@@ -342,11 +342,6 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	 * we want to allow parallel inserts in general; updates and deletes have
 	 * additional problems especially around combo CIDs.)
 	 *
-	 * We don't try to use parallel mode unless interruptible.  The leader
-	 * expects ProcessInterrupts() calls to reach HandleParallelMessages().
-	 * Even if we called HandleParallelMessages() another way, starting a
-	 * parallel worker is too delay-prone to be prudent when uncancellable.
-	 *
 	 * For now, we don't try to use parallel mode if we're running inside a
 	 * parallel worker.  We might eventually be able to relax this
 	 * restriction, but for now it seems best not to have parallel workers
@@ -357,7 +352,6 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		parse->commandType == CMD_SELECT &&
 		!parse->hasModifyingCTE &&
 		max_parallel_workers_per_gather > 0 &&
-		INTERRUPTS_CAN_BE_PROCESSED() &&
 		!IsParallelWorker())
 	{
 		/* all the cheap tests pass, so scan the query tree */
@@ -1047,10 +1041,10 @@ subquery_planner(PlannerGlobal *glob, Query *parse, PlannerInfo *parent_root,
 	 * cannot do so if the HAVING clause contains aggregates (obviously) or
 	 * volatile functions (since a HAVING clause is supposed to be executed
 	 * only once per group).  We also can't do this if there are any nonempty
-	 * grouping sets; moving such a clause into WHERE would potentially change
-	 * the results, if any referenced column isn't present in all the grouping
-	 * sets.  (If there are only empty grouping sets, then the HAVING clause
-	 * must be degenerate as discussed below.)
+	 * grouping sets and the clause references any columns that are nullable
+	 * by the grouping sets; moving such a clause into WHERE would potentially
+	 * change the results.  (If there are only empty grouping sets, then the
+	 * HAVING clause must be degenerate as discussed below.)
 	 *
 	 * Also, it may be that the clause is so expensive to execute that we're
 	 * better off doing it only once per group, despite the loss of
@@ -1088,15 +1082,16 @@ subquery_planner(PlannerGlobal *glob, Query *parse, PlannerInfo *parent_root,
 	{
 		Node	   *havingclause = (Node *) lfirst(l);
 
-		if ((parse->groupClause && parse->groupingSets) ||
-			contain_agg_clause(havingclause) ||
+		if (contain_agg_clause(havingclause) ||
 			contain_volatile_functions(havingclause) ||
-			contain_subplans(havingclause))
+			contain_subplans(havingclause) ||
+			(parse->groupClause && parse->groupingSets &&
+			 bms_is_member(root->group_rtindex, pull_varnos(root, havingclause))))
 		{
 			/* keep it in HAVING */
 			newHaving = lappend(newHaving, havingclause);
 		}
-		else if (parse->groupClause && !parse->groupingSets)
+		else if (parse->groupClause)
 		{
 			Node	   *whereclause;
 
@@ -4093,9 +4088,10 @@ create_ordinary_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 		 * If this is the topmost relation or if the parent relation is doing
 		 * full partitionwise aggregation, then we can do full partitionwise
 		 * aggregation provided that the GROUP BY clause contains all of the
-		 * partitioning columns at this level.  Otherwise, we can do at most
-		 * partial partitionwise aggregation.  But if partial aggregation is
-		 * not supported in general then we can't use it for partitionwise
+		 * partitioning columns at this level and the collation used by GROUP
+		 * BY matches the partitioning collation.  Otherwise, we can do at
+		 * most partial partitionwise aggregation.  But if partial aggregation
+		 * is not supported in general then we can't use it for partitionwise
 		 * aggregation either.
 		 *
 		 * Check parse->groupClause not processed_groupClause, because it's
@@ -8104,8 +8100,8 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 /*
  * group_by_has_partkey
  *
- * Returns true, if all the partition keys of the given relation are part of
- * the GROUP BY clauses, false otherwise.
+ * Returns true if all the partition keys of the given relation are part of
+ * the GROUP BY clauses, including having matching collation, false otherwise.
  */
 static bool
 group_by_has_partkey(RelOptInfo *input_rel,
@@ -8133,13 +8129,40 @@ group_by_has_partkey(RelOptInfo *input_rel,
 
 		foreach(lc, partexprs)
 		{
+			ListCell   *lg;
 			Expr	   *partexpr = lfirst(lc);
+			Oid			partcoll = input_rel->part_scheme->partcollation[cnt];
 
-			if (list_member(groupexprs, partexpr))
+			foreach(lg, groupexprs)
 			{
-				found = true;
-				break;
+				Expr	   *groupexpr = lfirst(lg);
+				Oid			groupcoll = exprCollation((Node *) groupexpr);
+
+				/*
+				 * Note: we can assume there is at most one RelabelType node;
+				 * eval_const_expressions() will have simplified if more than
+				 * one.
+				 */
+				if (IsA(groupexpr, RelabelType))
+					groupexpr = ((RelabelType *) groupexpr)->arg;
+
+				if (equal(groupexpr, partexpr))
+				{
+					/*
+					 * Reject a match if the grouping collation does not match
+					 * the partitioning collation.
+					 */
+					if (OidIsValid(partcoll) && OidIsValid(groupcoll) &&
+						partcoll != groupcoll)
+						return false;
+
+					found = true;
+					break;
+				}
 			}
+
+			if (found)
+				break;
 		}
 
 		/*

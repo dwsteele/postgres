@@ -2307,6 +2307,8 @@ ExecInitExprRec(Expr *node, ExprState *state,
 			{
 				JsonValueExpr *jve = (JsonValueExpr *) node;
 
+				Assert(jve->raw_expr != NULL);
+				ExecInitExprRec(jve->raw_expr, state, resv, resnull);
 				Assert(jve->formatted_expr != NULL);
 				ExecInitExprRec(jve->formatted_expr, state, resv, resnull);
 				break;
@@ -3996,18 +3998,28 @@ ExecBuildHash32Expr(TupleDesc desc, const TupleTableSlotOps *ops,
 {
 	ExprState  *state = makeNode(ExprState);
 	ExprEvalStep scratch = {0};
+	NullableDatum *iresult = NULL;
 	List	   *adjust_jumps = NIL;
 	ListCell   *lc;
 	ListCell   *lc2;
 	intptr_t	strict_opcode;
 	intptr_t	opcode;
+	int			num_exprs = list_length(hash_exprs);
 
-	Assert(list_length(hash_exprs) == list_length(collations));
+	Assert(num_exprs == list_length(collations));
 
 	state->parent = parent;
 
 	/* Insert setup steps as needed. */
 	ExecCreateExprSetupSteps(state, (Node *) hash_exprs);
+
+	/*
+	 * Make a place to store intermediate hash values between subsequent
+	 * hashing of individual expressions.  We only need this if there is more
+	 * than one expression to hash or an initial value plus one expression.
+	 */
+	if ((int64) num_exprs + (init_value != 0) > 1)
+		iresult = palloc(sizeof(NullableDatum));
 
 	if (init_value == 0)
 	{
@@ -4021,11 +4033,15 @@ ExecBuildHash32Expr(TupleDesc desc, const TupleTableSlotOps *ops,
 	}
 	else
 	{
-		/* Set up operation to set the initial value. */
+		/*
+		 * Set up operation to set the initial value.  Normally we store this
+		 * in the intermediate hash value location, but if there are no exprs
+		 * to hash, store it in the ExprState's result field.
+		 */
 		scratch.opcode = EEOP_HASHDATUM_SET_INITVAL;
 		scratch.d.hashdatum_initvalue.init_value = UInt32GetDatum(init_value);
-		scratch.resvalue = &state->resvalue;
-		scratch.resnull = &state->resnull;
+		scratch.resvalue = num_exprs > 0 ? &iresult->value : &state->resvalue;
+		scratch.resnull = num_exprs > 0 ? &iresult->isnull : &state->resnull;
 
 		ExprEvalPushStep(state, &scratch);
 
@@ -4063,8 +4079,26 @@ ExecBuildHash32Expr(TupleDesc desc, const TupleTableSlotOps *ops,
 						&fcinfo->args[0].value,
 						&fcinfo->args[0].isnull);
 
-		scratch.resvalue = &state->resvalue;
-		scratch.resnull = &state->resnull;
+		if (i == num_exprs - 1)
+		{
+			/* the result for hashing the final expr is stored in the state */
+			scratch.resvalue = &state->resvalue;
+			scratch.resnull = &state->resnull;
+		}
+		else
+		{
+			Assert(iresult != NULL);
+
+			/* intermediate values are stored in an intermediate result */
+			scratch.resvalue = &iresult->value;
+			scratch.resnull = &iresult->isnull;
+		}
+
+		/*
+		 * NEXT32 opcodes need to look at the intermediate result.  We might
+		 * as well just set this for all ops.  FIRSTs won't look at it.
+		 */
+		scratch.d.hashdatum.iresult = iresult;
 
 		/* Initialize function call parameter structure too */
 		InitFunctionCallInfoData(*fcinfo, finfo, 1, inputcollid, NULL, NULL);

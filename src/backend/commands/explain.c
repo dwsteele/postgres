@@ -71,8 +71,7 @@ typedef struct SerializeMetrics
 
 static void ExplainOneQuery(Query *query, int cursorOptions,
 							IntoClause *into, ExplainState *es,
-							const char *queryString, ParamListInfo params,
-							QueryEnvironment *queryEnv);
+							ParseState *pstate, ParamListInfo params);
 static void ExplainPrintJIT(ExplainState *es, int jit_flags,
 							JitInstrumentation *ji);
 static void ExplainPrintSerialize(ExplainState *es,
@@ -350,7 +349,7 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 		{
 			ExplainOneQuery(lfirst_node(Query, l),
 							CURSOR_OPT_PARALLEL_OK, NULL, es,
-							pstate->p_sourcetext, params, pstate->p_queryEnv);
+							pstate, params);
 
 			/* Separate plans with an appropriate separator */
 			if (lnext(rewritten, l) != NULL)
@@ -436,24 +435,22 @@ ExplainResultDesc(ExplainStmt *stmt)
 static void
 ExplainOneQuery(Query *query, int cursorOptions,
 				IntoClause *into, ExplainState *es,
-				const char *queryString, ParamListInfo params,
-				QueryEnvironment *queryEnv)
+				ParseState *pstate, ParamListInfo params)
 {
 	/* planner will not cope with utility statements */
 	if (query->commandType == CMD_UTILITY)
 	{
-		ExplainOneUtility(query->utilityStmt, into, es, queryString, params,
-						  queryEnv);
+		ExplainOneUtility(query->utilityStmt, into, es, pstate, params);
 		return;
 	}
 
 	/* if an advisor plugin is present, let it manage things */
 	if (ExplainOneQuery_hook)
 		(*ExplainOneQuery_hook) (query, cursorOptions, into, es,
-								 queryString, params, queryEnv);
+								 pstate->p_sourcetext, params, pstate->p_queryEnv);
 	else
 		standard_ExplainOneQuery(query, cursorOptions, into, es,
-								 queryString, params, queryEnv);
+								 pstate->p_sourcetext, params, pstate->p_queryEnv);
 }
 
 /*
@@ -534,8 +531,7 @@ standard_ExplainOneQuery(Query *query, int cursorOptions,
  */
 void
 ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
-				  const char *queryString, ParamListInfo params,
-				  QueryEnvironment *queryEnv)
+				  ParseState *pstate, ParamListInfo params)
 {
 	if (utilityStmt == NULL)
 		return;
@@ -547,7 +543,9 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 		 * ExplainOneQuery.  Copy to be safe in the EXPLAIN EXECUTE case.
 		 */
 		CreateTableAsStmt *ctas = (CreateTableAsStmt *) utilityStmt;
+		Query	   *ctas_query;
 		List	   *rewritten;
+		JumbleState *jstate = NULL;
 
 		/*
 		 * Check if the relation exists or not.  This is done at this stage to
@@ -565,11 +563,16 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 			return;
 		}
 
-		rewritten = QueryRewrite(castNode(Query, copyObject(ctas->query)));
+		ctas_query = castNode(Query, copyObject(ctas->query));
+		if (IsQueryIdEnabled())
+			jstate = JumbleQuery(ctas_query);
+		if (post_parse_analyze_hook)
+			(*post_parse_analyze_hook) (pstate, ctas_query, jstate);
+		rewritten = QueryRewrite(ctas_query);
 		Assert(list_length(rewritten) == 1);
 		ExplainOneQuery(linitial_node(Query, rewritten),
 						CURSOR_OPT_PARALLEL_OK, ctas->into, es,
-						queryString, params, queryEnv);
+						pstate, params);
 	}
 	else if (IsA(utilityStmt, DeclareCursorStmt))
 	{
@@ -582,17 +585,25 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 		 * be created, however.
 		 */
 		DeclareCursorStmt *dcs = (DeclareCursorStmt *) utilityStmt;
+		Query	   *dcs_query;
 		List	   *rewritten;
+		JumbleState *jstate = NULL;
 
-		rewritten = QueryRewrite(castNode(Query, copyObject(dcs->query)));
+		dcs_query = castNode(Query, copyObject(dcs->query));
+		if (IsQueryIdEnabled())
+			jstate = JumbleQuery(dcs_query);
+		if (post_parse_analyze_hook)
+			(*post_parse_analyze_hook) (pstate, dcs_query, jstate);
+
+		rewritten = QueryRewrite(dcs_query);
 		Assert(list_length(rewritten) == 1);
 		ExplainOneQuery(linitial_node(Query, rewritten),
 						dcs->options, NULL, es,
-						queryString, params, queryEnv);
+						pstate, params);
 	}
 	else if (IsA(utilityStmt, ExecuteStmt))
 		ExplainExecuteQuery((ExecuteStmt *) utilityStmt, into, es,
-							queryString, params, queryEnv);
+							pstate, params);
 	else if (IsA(utilityStmt, NotifyStmt))
 	{
 		if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -1364,6 +1375,96 @@ ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used)
 }
 
 /*
+ * plan_is_disabled
+ *		Checks if the given plan node type was disabled during query planning.
+ *		This is evident by the disable_node field being higher than the sum of
+ *		the disabled_node field from the plan's children.
+ */
+static bool
+plan_is_disabled(Plan *plan)
+{
+	int			child_disabled_nodes;
+
+	/* The node is certainly not disabled if this is zero */
+	if (plan->disabled_nodes == 0)
+		return false;
+
+	child_disabled_nodes = 0;
+
+	/*
+	 * Handle special nodes first.  Children of BitmapOrs and BitmapAnds can't
+	 * be disabled, so no need to handle those specifically.
+	 */
+	if (IsA(plan, Append))
+	{
+		ListCell   *lc;
+		Append	   *aplan = (Append *) plan;
+
+		/*
+		 * Sum the Append childrens' disabled_nodes.  This purposefully
+		 * includes any run-time pruned children.  Ignoring those could give
+		 * us the incorrect number of disabled nodes.
+		 */
+		foreach(lc, aplan->appendplans)
+		{
+			Plan	   *subplan = lfirst(lc);
+
+			child_disabled_nodes += subplan->disabled_nodes;
+		}
+	}
+	else if (IsA(plan, MergeAppend))
+	{
+		ListCell   *lc;
+		MergeAppend *maplan = (MergeAppend *) plan;
+
+		/*
+		 * Sum the MergeAppend childrens' disabled_nodes.  This purposefully
+		 * includes any run-time pruned children.  Ignoring those could give
+		 * us the incorrect number of disabled nodes.
+		 */
+		foreach(lc, maplan->mergeplans)
+		{
+			Plan	   *subplan = lfirst(lc);
+
+			child_disabled_nodes += subplan->disabled_nodes;
+		}
+	}
+	else if (IsA(plan, SubqueryScan))
+		child_disabled_nodes += ((SubqueryScan *) plan)->subplan->disabled_nodes;
+	else if (IsA(plan, CustomScan))
+	{
+		ListCell   *lc;
+		CustomScan *cplan = (CustomScan *) plan;
+
+		foreach(lc, cplan->custom_plans)
+		{
+			Plan	   *subplan = lfirst(lc);
+
+			child_disabled_nodes += subplan->disabled_nodes;
+		}
+	}
+	else
+	{
+		/*
+		 * Else, sum up disabled_nodes from the plan's inner and outer side.
+		 */
+		if (outerPlan(plan))
+			child_disabled_nodes += outerPlan(plan)->disabled_nodes;
+		if (innerPlan(plan))
+			child_disabled_nodes += innerPlan(plan)->disabled_nodes;
+	}
+
+	/*
+	 * It's disabled if the plan's disable_nodes is higher than the sum of its
+	 * child's plan disabled_nodes.
+	 */
+	if (plan->disabled_nodes > child_disabled_nodes)
+		return true;
+
+	return false;
+}
+
+/*
  * ExplainNode -
  *	  Appends a description of a plan tree to es->str
  *
@@ -1399,6 +1500,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	ExplainWorkersState *save_workers_state = es->workers_state;
 	int			save_indent = es->indent;
 	bool		haschildren;
+	bool		isdisabled;
 
 	/*
 	 * Prepare per-worker output buffers, if needed.  We'll append the data in
@@ -1914,9 +2016,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 		appendStringInfoChar(es->str, '\n');
 
-	if (plan->disabled_nodes != 0)
-		ExplainPropertyInteger("Disabled Nodes", NULL, plan->disabled_nodes,
-							   es);
+
+	isdisabled = plan_is_disabled(plan);
+	if (es->format != EXPLAIN_FORMAT_TEXT || isdisabled)
+		ExplainPropertyBool("Disabled", isdisabled, es);
 
 	/* prepare per-worker general execution details */
 	if (es->workers_state && es->verbose)
