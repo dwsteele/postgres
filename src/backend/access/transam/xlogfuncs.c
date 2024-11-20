@@ -132,6 +132,7 @@ pg_backup_stop(PG_FUNCTION_ARGS)
 	bool		waitforarchive = PG_GETARG_BOOL(0);
 	char	   *backup_label;
 	bytea	   *pg_control_bytea;
+	uint8_t		pg_control[PG_CONTROL_FILE_SIZE];
 	SessionBackupState status = get_backup_status();
 
 	/* Initialize attributes information in the tuple descriptor */
@@ -154,10 +155,11 @@ pg_backup_stop(PG_FUNCTION_ARGS)
 	backup_label = build_backup_content(backup_state, false);
 
 	/* Build the contents of pg_control */
-	pg_control_bytea = (bytea *)palloc_aligned(PG_CONTROL_FILE_SIZE + VARHDRSZ,
-											   PG_CACHE_LINE_SIZE, 0);
+	backup_control_file(pg_control);
+
+	pg_control_bytea = (bytea *) palloc(PG_CONTROL_FILE_SIZE + VARHDRSZ);
 	SET_VARSIZE(pg_control_bytea, PG_CONTROL_FILE_SIZE + VARHDRSZ);
-	backup_control_file((uint8_t *)VARDATA(pg_control_bytea));
+	memcpy(VARDATA(pg_control_bytea), pg_control, PG_CONTROL_FILE_SIZE);
 
 	values[0] = LSNGetDatum(backup_state->stoppoint);
 	values[1] = CStringGetTextDatum(backup_label);
