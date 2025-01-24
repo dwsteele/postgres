@@ -3,7 +3,7 @@
  * rewriteHandler.c
  *		Primary module of query rewriter.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -641,6 +641,7 @@ rewriteRuleAction(Query *parsetree,
 									  0,
 									  rt_fetch(new_varno, sub_action->rtable),
 									  parsetree->targetList,
+									  sub_action->resultRelation,
 									  (event == CMD_UPDATE) ?
 									  REPLACEVARS_CHANGE_VARNO :
 									  REPLACEVARS_SUBSTITUTE_NULL,
@@ -674,9 +675,14 @@ rewriteRuleAction(Query *parsetree,
 									  rt_fetch(parsetree->resultRelation,
 											   parsetree->rtable),
 									  rule_action->returningList,
+									  rule_action->resultRelation,
 									  REPLACEVARS_REPORT_ERROR,
 									  0,
 									  &rule_action->hasSubLinks);
+
+		/* use triggering query's aliases for OLD and NEW in RETURNING list */
+		rule_action->returningOldAlias = parsetree->returningOldAlias;
+		rule_action->returningNewAlias = parsetree->returningNewAlias;
 
 		/*
 		 * There could have been some SubLinks in parsetree's returningList,
@@ -1988,8 +1994,7 @@ fireRIRonSubLink(Node *node, fireRIRonSubLink_context *context)
 	 * Do NOT recurse into Query nodes, because fireRIRrules already processed
 	 * subselects of subselects for us.
 	 */
-	return expression_tree_walker(node, fireRIRonSubLink,
-								  (void *) context);
+	return expression_tree_walker(node, fireRIRonSubLink, context);
 }
 
 
@@ -2189,7 +2194,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 		context.activeRIRs = activeRIRs;
 		context.hasRowSecurity = false;
 
-		query_tree_walker(parsetree, fireRIRonSubLink, (void *) &context,
+		query_tree_walker(parsetree, fireRIRonSubLink, &context,
 						  QTW_IGNORE_RC_SUBQUERIES);
 
 		/*
@@ -2272,10 +2277,10 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 				fire_context.hasRowSecurity = false;
 
 				expression_tree_walker((Node *) securityQuals,
-									   fireRIRonSubLink, (void *) &fire_context);
+									   fireRIRonSubLink, &fire_context);
 
 				expression_tree_walker((Node *) withCheckOptions,
-									   fireRIRonSubLink, (void *) &fire_context);
+									   fireRIRonSubLink, &fire_context);
 
 				/*
 				 * We can ignore the value of fire_context.hasRowSecurity
@@ -2359,6 +2364,7 @@ CopyAndAddInvertedQual(Query *parsetree,
 											 rt_fetch(rt_index,
 													  parsetree->rtable),
 											 parsetree->targetList,
+											 parsetree->resultRelation,
 											 (event == CMD_UPDATE) ?
 											 REPLACEVARS_CHANGE_VARNO :
 											 REPLACEVARS_SUBSTITUTE_NULL,
@@ -3583,6 +3589,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 								  0,
 								  view_rte,
 								  view_targetlist,
+								  new_rt_index,
 								  REPLACEVARS_REPORT_ERROR,
 								  0,
 								  NULL);
@@ -3734,6 +3741,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 									  0,
 									  view_rte,
 									  tmp_tlist,
+									  new_rt_index,
 									  REPLACEVARS_REPORT_ERROR,
 									  0,
 									  &parsetree->hasSubLinks);

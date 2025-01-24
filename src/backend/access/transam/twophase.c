@@ -3,7 +3,7 @@
  * twophase.c
  *		Two-phase commit support functions.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -466,7 +466,7 @@ MarkAsPreparingGuts(GlobalTransaction gxact, TransactionId xid, const char *gid,
 	proc->databaseId = databaseid;
 	proc->roleId = owner;
 	proc->tempNamespaceId = InvalidOid;
-	proc->isBackgroundWorker = false;
+	proc->isRegularBackend = false;
 	proc->lwWaiting = LW_WS_NOT_WAITING;
 	proc->lwWaitMode = 0;
 	proc->waitLock = NULL;
@@ -747,7 +747,7 @@ pg_prepared_xact(PG_FUNCTION_ARGS)
 		 * out as a result set.
 		 */
 		status = (Working_State *) palloc(sizeof(Working_State));
-		funcctx->user_fctx = (void *) status;
+		funcctx->user_fctx = status;
 
 		status->ngxacts = GetPreparedTransactionList(&status->array);
 		status->currIdx = 0;
@@ -1707,8 +1707,7 @@ ProcessRecords(char *bufptr, TransactionId xid,
 		bufptr += MAXALIGN(sizeof(TwoPhaseRecordOnDisk));
 
 		if (callbacks[record->rmid] != NULL)
-			callbacks[record->rmid] (xid, record->info,
-									 (void *) bufptr, record->len);
+			callbacks[record->rmid] (xid, record->info, bufptr, record->len);
 
 		bufptr += MAXALIGN(record->len);
 	}

@@ -3,7 +3,7 @@
  * pgoutput.c
  *		Logical Replication output plugin
  *
- * Copyright (c) 2012-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/backend/replication/pgoutput/pgoutput.c
@@ -128,10 +128,13 @@ typedef struct RelationSyncEntry
 	bool		schema_sent;
 
 	/*
-	 * This is set if the 'publish_generated_columns' parameter is true, and
-	 * the relation contains generated columns.
+	 * This will be PUBLISH_GENCOLS_STORED if the relation contains generated
+	 * columns and the 'publish_generated_columns' parameter is set to
+	 * PUBLISH_GENCOLS_STORED. Otherwise, it will be PUBLISH_GENCOLS_NONE,
+	 * indicating that no generated columns should be published, unless
+	 * explicitly specified in the column list.
 	 */
-	bool		include_gencols;
+	PublishGencolsType include_gencols_type;
 	List	   *streamed_txns;	/* streamed toplevel transactions with this
 								 * schema */
 
@@ -435,6 +438,10 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 	data->cachectx = AllocSetContextCreate(ctx->context,
 										   "logical replication cache context",
 										   ALLOCSET_DEFAULT_SIZES);
+
+	data->pubctx = AllocSetContextCreate(ctx->context,
+										 "logical replication publication list context",
+										 ALLOCSET_SMALL_SIZES);
 
 	ctx->output_plugin_private = data;
 
@@ -759,7 +766,7 @@ send_relation_and_attrs(Relation relation, TransactionId xid,
 {
 	TupleDesc	desc = RelationGetDescr(relation);
 	Bitmapset  *columns = relentry->columns;
-	bool		include_gencols = relentry->include_gencols;
+	PublishGencolsType include_gencols_type = relentry->include_gencols_type;
 	int			i;
 
 	/*
@@ -774,7 +781,8 @@ send_relation_and_attrs(Relation relation, TransactionId xid,
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
 
-		if (!logicalrep_should_publish_column(att, columns, include_gencols))
+		if (!logicalrep_should_publish_column(att, columns,
+											  include_gencols_type))
 			continue;
 
 		if (att->atttypid < FirstGenbkiObjectId)
@@ -786,7 +794,8 @@ send_relation_and_attrs(Relation relation, TransactionId xid,
 	}
 
 	OutputPluginPrepareWrite(ctx, false);
-	logicalrep_write_rel(ctx->out, xid, relation, columns, include_gencols);
+	logicalrep_write_rel(ctx->out, xid, relation, columns,
+						 include_gencols_type);
 	OutputPluginWrite(ctx, false);
 }
 
@@ -1040,7 +1049,7 @@ check_and_init_gencol(PGOutputData *data, List *publications,
 	/* There are no generated columns to be published. */
 	if (!gencolpresent)
 	{
-		entry->include_gencols = false;
+		entry->include_gencols_type = PUBLISH_GENCOLS_NONE;
 		return;
 	}
 
@@ -1060,10 +1069,10 @@ check_and_init_gencol(PGOutputData *data, List *publications,
 
 		if (first)
 		{
-			entry->include_gencols = pub->pubgencols;
+			entry->include_gencols_type = pub->pubgencols_type;
 			first = false;
 		}
-		else if (entry->include_gencols != pub->pubgencols)
+		else if (entry->include_gencols_type != pub->pubgencols_type)
 			ereport(ERROR,
 					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cannot use different values of publish_generated_columns for table \"%s.%s\" in different publications",
@@ -1127,7 +1136,8 @@ pgoutput_column_list_init(PGOutputData *data, List *publications,
 			{
 				MemoryContext oldcxt = MemoryContextSwitchTo(entry->entry_cxt);
 
-				relcols = pub_form_cols_map(relation, entry->include_gencols);
+				relcols = pub_form_cols_map(relation,
+											entry->include_gencols_type);
 				MemoryContextSwitchTo(oldcxt);
 			}
 
@@ -1193,8 +1203,8 @@ init_tuple_slot(PGOutputData *data, Relation relation,
 		TupleDesc	indesc = RelationGetDescr(relation);
 		TupleDesc	outdesc = RelationGetDescr(ancestor);
 
-		/* Map must live as long as the session does. */
-		oldctx = MemoryContextSwitchTo(CacheMemoryContext);
+		/* Map must live as long as the logical decoding context. */
+		oldctx = MemoryContextSwitchTo(data->cachectx);
 
 		entry->attrmap = build_attrmap_by_name_if_req(indesc, outdesc, false);
 
@@ -1340,7 +1350,7 @@ pgoutput_row_filter(Relation relation, TupleTableSlot *old_slot,
 	 */
 	for (i = 0; i < desc->natts; i++)
 	{
-		Form_pg_attribute att = TupleDescAttr(desc, i);
+		CompactAttribute *att = TupleDescCompactAttr(desc, i);
 
 		/*
 		 * if the column in the new tuple or old tuple is null, nothing to do
@@ -1567,17 +1577,17 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		case REORDER_BUFFER_CHANGE_INSERT:
 			logicalrep_write_insert(ctx->out, xid, targetrel, new_slot,
 									data->binary, relentry->columns,
-									relentry->include_gencols);
+									relentry->include_gencols_type);
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
 			logicalrep_write_update(ctx->out, xid, targetrel, old_slot,
 									new_slot, data->binary, relentry->columns,
-									relentry->include_gencols);
+									relentry->include_gencols_type);
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			logicalrep_write_delete(ctx->out, xid, targetrel, old_slot,
 									data->binary, relentry->columns,
-									relentry->include_gencols);
+									relentry->include_gencols_type);
 			break;
 		default:
 			Assert(false);
@@ -1734,9 +1744,9 @@ pgoutput_origin_filter(LogicalDecodingContext *ctx,
 /*
  * Shutdown the output plugin.
  *
- * Note, we don't need to clean the data->context and data->cachectx as
- * they are child contexts of the ctx->context so they will be cleaned up by
- * logical decoding machinery.
+ * Note, we don't need to clean the data->context, data->cachectx, and
+ * data->pubctx as they are child contexts of the ctx->context so they
+ * will be cleaned up by logical decoding machinery.
  */
 static void
 pgoutput_shutdown(LogicalDecodingContext *ctx)
@@ -2028,7 +2038,7 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 	{
 		entry->replicate_valid = false;
 		entry->schema_sent = false;
-		entry->include_gencols = false;
+		entry->include_gencols_type = PUBLISH_GENCOLS_NONE;
 		entry->streamed_txns = NIL;
 		entry->pubactions.pubinsert = entry->pubactions.pubupdate =
 			entry->pubactions.pubdelete = entry->pubactions.pubtruncate = false;
@@ -2063,12 +2073,9 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 		/* Reload publications if needed before use. */
 		if (!publications_valid)
 		{
-			oldctx = MemoryContextSwitchTo(CacheMemoryContext);
-			if (data->publications)
-			{
-				list_free_deep(data->publications);
-				data->publications = NIL;
-			}
+			MemoryContextReset(data->pubctx);
+
+			oldctx = MemoryContextSwitchTo(data->pubctx);
 			data->publications = LoadPublications(data->publication_names);
 			MemoryContextSwitchTo(oldctx);
 			publications_valid = true;
@@ -2081,7 +2088,7 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 		 * earlier definition.
 		 */
 		entry->schema_sent = false;
-		entry->include_gencols = false;
+		entry->include_gencols_type = PUBLISH_GENCOLS_NONE;
 		list_free(entry->streamed_txns);
 		entry->streamed_txns = NIL;
 		bms_free(entry->columns);
@@ -2095,9 +2102,33 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 		 * Tuple slots cleanups. (Will be rebuilt later if needed).
 		 */
 		if (entry->old_slot)
+		{
+			TupleDesc	desc = entry->old_slot->tts_tupleDescriptor;
+
+			Assert(desc->tdrefcount == -1);
+
 			ExecDropSingleTupleTableSlot(entry->old_slot);
+
+			/*
+			 * ExecDropSingleTupleTableSlot() would not free the TupleDesc, so
+			 * do it now to avoid any leaks.
+			 */
+			FreeTupleDesc(desc);
+		}
 		if (entry->new_slot)
+		{
+			TupleDesc	desc = entry->new_slot->tts_tupleDescriptor;
+
+			Assert(desc->tdrefcount == -1);
+
 			ExecDropSingleTupleTableSlot(entry->new_slot);
+
+			/*
+			 * ExecDropSingleTupleTableSlot() would not free the TupleDesc, so
+			 * do it now to avoid any leaks.
+			 */
+			FreeTupleDesc(desc);
+		}
 
 		entry->old_slot = NULL;
 		entry->new_slot = NULL;

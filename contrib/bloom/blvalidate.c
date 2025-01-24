@@ -3,7 +3,7 @@
  * blvalidate.c
  *	  Opclass validator for bloom.
  *
- * Copyright (c) 2016-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/bloom/blvalidate.c
@@ -124,7 +124,7 @@ blvalidate(Oid opclassoid)
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("gist opfamily %s contains function %s with wrong signature for support number %d",
+					 errmsg("bloom opfamily %s contains function %s with wrong signature for support number %d",
 							opfamilyname,
 							format_procedure(procform->amproc),
 							procform->amprocnum)));
