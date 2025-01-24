@@ -710,7 +710,7 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		if (ControlFile->backupLabelRequired)
 			ereport(FATAL,
 					(errmsg("could not find backup_label required for recovery"),
-					 errhint("backup_label must be present for recovery to succeed")));
+					 errhint("backup_label must be present for recovery to proceed")));
 
 		/*
 		 * If tablespace_map file is present without backup_label file, there
