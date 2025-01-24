@@ -14,7 +14,7 @@
  *	plan --- consider improving this someday.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  * src/backend/utils/adt/ri_triggers.c
  *
@@ -129,6 +129,7 @@ typedef struct RI_ConstraintInfo
 	Oid			ff_eq_oprs[RI_MAX_NUMKEYS]; /* equality operators (FK = FK) */
 	Oid			period_contained_by_oper;	/* anyrange <@ anyrange */
 	Oid			agged_period_contained_by_oper; /* fkattr <@ range_agg(pkattr) */
+	Oid			period_intersect_oper;	/* anyrange * anyrange */
 	dlist_node	valid_link;		/* Link in list of valid entries */
 } RI_ConstraintInfo;
 
@@ -228,6 +229,7 @@ static bool ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 							RI_QueryKey *qkey, SPIPlanPtr qplan,
 							Relation fk_rel, Relation pk_rel,
 							TupleTableSlot *oldslot, TupleTableSlot *newslot,
+							bool is_restrict,
 							bool detectNewRows, int expect_OK);
 static void ri_ExtractValues(Relation rel, TupleTableSlot *slot,
 							 const RI_ConstraintInfo *riinfo, bool rel_is_pk,
@@ -235,7 +237,7 @@ static void ri_ExtractValues(Relation rel, TupleTableSlot *slot,
 static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 							   Relation pk_rel, Relation fk_rel,
 							   TupleTableSlot *violatorslot, TupleDesc tupdesc,
-							   int queryno, bool partgone) pg_attribute_noreturn();
+							   int queryno, bool is_restrict, bool partgone) pg_attribute_noreturn();
 
 
 /*
@@ -449,6 +451,7 @@ RI_FKey_check(TriggerData *trigdata)
 	ri_PerformCheck(riinfo, &qkey, qplan,
 					fk_rel, pk_rel,
 					NULL, newslot,
+					false,
 					pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE,
 					SPI_OK_SELECT);
 
@@ -613,6 +616,7 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 	result = ri_PerformCheck(riinfo, &qkey, qplan,
 							 fk_rel, pk_rel,
 							 oldslot, NULL,
+							 false,
 							 true,	/* treat like update */
 							 SPI_OK_SELECT);
 
@@ -731,8 +735,11 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 	 * not do anything.  However, this check should only be made in the NO
 	 * ACTION case; in RESTRICT cases we don't wish to allow another row to be
 	 * substituted.
+	 *
+	 * If the foreign key has PERIOD, we incorporate looking for replacement
+	 * rows in the main SQL query below, so we needn't do it here.
 	 */
-	if (is_no_action &&
+	if (is_no_action && !riinfo->hasperiod &&
 		ri_Check_Pk_Match(pk_rel, fk_rel, oldslot, riinfo))
 	{
 		table_close(fk_rel, RowShareLock);
@@ -750,8 +757,10 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 	if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
 	{
 		StringInfoData querybuf;
+		char		pkrelname[MAX_QUOTED_REL_NAME_LEN];
 		char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
 		char		attname[MAX_QUOTED_NAME_LEN];
+		char		periodattname[MAX_QUOTED_NAME_LEN];
 		char		paramname[16];
 		const char *querysep;
 		Oid			queryoids[RI_MAX_NUMKEYS];
@@ -787,6 +796,89 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 			querysep = "AND";
 			queryoids[i] = pk_type;
 		}
+
+		/*----------
+		 * For temporal foreign keys, a reference could still be valid if the
+		 * referenced range didn't change too much.  Also if a referencing
+		 * range extends past the current PK row, we don't want to check that
+		 * part: some other PK row should fulfill it.  We only want to check
+		 * the part matching the PK record we've changed.  Therefore to find
+		 * invalid records we do this:
+		 *
+		 * SELECT 1 FROM [ONLY] <fktable> x WHERE $1 = x.fkatt1 [AND ...]
+		 * -- begin temporal
+		 * AND $n && x.fkperiod
+		 * AND NOT coalesce((x.fkperiod * $n) <@
+		 *  (SELECT range_agg(r)
+		 *   FROM (SELECT y.pkperiod r
+		 *         FROM [ONLY] <pktable> y
+		 *         WHERE $1 = y.pkatt1 [AND ...] AND $n && y.pkperiod
+		 *         FOR KEY SHARE OF y) y2), false)
+		 * -- end temporal
+		 * FOR KEY SHARE OF x
+		 *
+		 * We need the coalesce in case the first subquery returns no rows.
+		 * We need the second subquery because FOR KEY SHARE doesn't support
+		 * aggregate queries.
+		 */
+		if (riinfo->hasperiod && is_no_action)
+		{
+			Oid			pk_period_type = RIAttType(pk_rel, riinfo->pk_attnums[riinfo->nkeys - 1]);
+			Oid			fk_period_type = RIAttType(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]);
+			StringInfoData intersectbuf;
+			StringInfoData replacementsbuf;
+			char	   *pk_only = pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+				"" : "ONLY ";
+
+			quoteOneName(attname, RIAttName(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]));
+			sprintf(paramname, "$%d", riinfo->nkeys);
+
+			appendStringInfoString(&querybuf, " AND NOT coalesce(");
+
+			/* Intersect the fk with the old pk range */
+			initStringInfo(&intersectbuf);
+			appendStringInfoString(&intersectbuf, "(");
+			ri_GenerateQual(&intersectbuf, "",
+							attname, fk_period_type,
+							riinfo->period_intersect_oper,
+							paramname, pk_period_type);
+			appendStringInfoString(&intersectbuf, ")");
+
+			/* Find the remaining history */
+			initStringInfo(&replacementsbuf);
+			appendStringInfoString(&replacementsbuf, "(SELECT pg_catalog.range_agg(r) FROM ");
+
+			quoteOneName(periodattname, RIAttName(pk_rel, riinfo->pk_attnums[riinfo->nkeys - 1]));
+			quoteRelationName(pkrelname, pk_rel);
+			appendStringInfo(&replacementsbuf, "(SELECT y.%s r FROM %s%s y",
+							 periodattname, pk_only, pkrelname);
+
+			/* Restrict pk rows to what matches */
+			querysep = "WHERE";
+			for (int i = 0; i < riinfo->nkeys; i++)
+			{
+				Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+
+				quoteOneName(attname,
+							 RIAttName(pk_rel, riinfo->pk_attnums[i]));
+				sprintf(paramname, "$%d", i + 1);
+				ri_GenerateQual(&replacementsbuf, querysep,
+								paramname, pk_type,
+								riinfo->pp_eq_oprs[i],
+								attname, pk_type);
+				querysep = "AND";
+				queryoids[i] = pk_type;
+			}
+			appendStringInfoString(&replacementsbuf, " FOR KEY SHARE OF y) y2)");
+
+			ri_GenerateQual(&querybuf, "",
+							intersectbuf.data, fk_period_type,
+							riinfo->agged_period_contained_by_oper,
+							replacementsbuf.data, ANYMULTIRANGEOID);
+			/* end of coalesce: */
+			appendStringInfoString(&querybuf, ", false)");
+		}
+
 		appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
 
 		/* Prepare and save the plan */
@@ -800,6 +892,7 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 	ri_PerformCheck(riinfo, &qkey, qplan,
 					fk_rel, pk_rel,
 					oldslot, NULL,
+					!is_no_action,
 					true,		/* must detect new rows */
 					SPI_OK_SELECT);
 
@@ -901,6 +994,7 @@ RI_FKey_cascade_del(PG_FUNCTION_ARGS)
 	ri_PerformCheck(riinfo, &qkey, qplan,
 					fk_rel, pk_rel,
 					oldslot, NULL,
+					false,
 					true,		/* must detect new rows */
 					SPI_OK_DELETE);
 
@@ -1017,6 +1111,7 @@ RI_FKey_cascade_upd(PG_FUNCTION_ARGS)
 	ri_PerformCheck(riinfo, &qkey, qplan,
 					fk_rel, pk_rel,
 					oldslot, newslot,
+					false,
 					true,		/* must detect new rows */
 					SPI_OK_UPDATE);
 
@@ -1244,6 +1339,7 @@ ri_set(TriggerData *trigdata, bool is_set_null, int tgkind)
 	ri_PerformCheck(riinfo, &qkey, qplan,
 					fk_rel, pk_rel,
 					oldslot, NULL,
+					false,
 					true,		/* must detect new rows */
 					SPI_OK_UPDATE);
 
@@ -1690,7 +1786,7 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 		ri_ReportViolation(&fake_riinfo,
 						   pk_rel, fk_rel,
 						   slot, tupdesc,
-						   RI_PLAN_CHECK_LOOKUPPK, false);
+						   RI_PLAN_CHECK_LOOKUPPK, false, false);
 
 		ExecDropSingleTupleTableSlot(slot);
 	}
@@ -1906,7 +2002,7 @@ RI_PartitionRemove_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 			fake_riinfo.pk_attnums[i] = i + 1;
 
 		ri_ReportViolation(&fake_riinfo, pk_rel, fk_rel,
-						   slot, tupdesc, 0, true);
+						   slot, tupdesc, 0, false, true);
 	}
 
 	if (SPI_finish() != SPI_OK_FINISH)
@@ -2244,7 +2340,8 @@ ri_LoadConstraintInfo(Oid constraintOid)
 
 		FindFKPeriodOpers(opclass,
 						  &riinfo->period_contained_by_oper,
-						  &riinfo->agged_period_contained_by_oper);
+						  &riinfo->agged_period_contained_by_oper,
+						  &riinfo->period_intersect_oper);
 	}
 
 	ReleaseSysCache(tup);
@@ -2387,6 +2484,7 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 				RI_QueryKey *qkey, SPIPlanPtr qplan,
 				Relation fk_rel, Relation pk_rel,
 				TupleTableSlot *oldslot, TupleTableSlot *newslot,
+				bool is_restrict,
 				bool detectNewRows, int expect_OK)
 {
 	Relation	query_rel,
@@ -2511,7 +2609,7 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 						   pk_rel, fk_rel,
 						   newslot ? newslot : oldslot,
 						   NULL,
-						   qkey->constr_queryno, false);
+						   qkey->constr_queryno, is_restrict, false);
 
 	return SPI_processed != 0;
 }
@@ -2552,7 +2650,7 @@ static void
 ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 				   Relation pk_rel, Relation fk_rel,
 				   TupleTableSlot *violatorslot, TupleDesc tupdesc,
-				   int queryno, bool partgone)
+				   int queryno, bool is_restrict, bool partgone)
 {
 	StringInfoData key_names;
 	StringInfoData key_values;
@@ -2681,6 +2779,20 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 						   RelationGetRelationName(pk_rel)) :
 				 errdetail("Key is not present in table \"%s\".",
 						   RelationGetRelationName(pk_rel)),
+				 errtableconstraint(fk_rel, NameStr(riinfo->conname))));
+	else if (is_restrict)
+		ereport(ERROR,
+				(errcode(ERRCODE_RESTRICT_VIOLATION),
+				 errmsg("update or delete on table \"%s\" violates RESTRICT setting of foreign key constraint \"%s\" on table \"%s\"",
+						RelationGetRelationName(pk_rel),
+						NameStr(riinfo->conname),
+						RelationGetRelationName(fk_rel)),
+				 has_perm ?
+				 errdetail("Key (%s)=(%s) is referenced from table \"%s\".",
+						   key_names.data, key_values.data,
+						   RelationGetRelationName(fk_rel)) :
+				 errdetail("Key is referenced from table \"%s\".",
+						   RelationGetRelationName(fk_rel)),
 				 errtableconstraint(fk_rel, NameStr(riinfo->conname))));
 	else
 		ereport(ERROR,
@@ -2910,7 +3022,7 @@ ri_KeysEqual(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *newslot,
 			 * difference for ON UPDATE CASCADE, but for consistency we treat
 			 * all changes to the PK the same.
 			 */
-			Form_pg_attribute att = TupleDescAttr(oldslot->tts_tupleDescriptor, attnums[i] - 1);
+			CompactAttribute *att = TupleDescCompactAttr(oldslot->tts_tupleDescriptor, attnums[i] - 1);
 
 			if (!datum_image_eq(oldvalue, newvalue, att->attbyval, att->attlen))
 				return false;
