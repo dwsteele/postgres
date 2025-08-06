@@ -40,6 +40,7 @@
 #include "postmaster/interrupt.h"
 #include "postmaster/pgarch.h"
 #include "storage/condition_variable.h"
+#include "storage/aio_subsys.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -147,7 +148,7 @@ static bool pgarch_archiveXlog(char *xlog);
 static bool pgarch_readyXlog(char *xlog);
 static void pgarch_archiveDone(char *xlog);
 static void pgarch_die(int code, Datum arg);
-static void HandlePgArchInterrupts(void);
+static void ProcessPgArchInterrupts(void);
 static int	ready_file_comparator(Datum a, Datum b, void *arg);
 static void LoadArchiveLibrary(void);
 static void pgarch_call_module_shutdown_cb(int code, Datum arg);
@@ -214,7 +215,7 @@ PgArchCanRestart(void)
 
 /* Main entry point for archiver process */
 void
-PgArchiverMain(char *startup_data, size_t startup_data_len)
+PgArchiverMain(const void *startup_data, size_t startup_data_len)
 {
 	Assert(startup_data_len == 0);
 
@@ -324,7 +325,7 @@ pgarch_MainLoop(void)
 		time_to_stop = ready_to_stop;
 
 		/* Check for barrier events and config update */
-		HandlePgArchInterrupts();
+		ProcessPgArchInterrupts();
 
 		/*
 		 * If we've gotten SIGTERM, we normally just sit and do nothing until
@@ -415,7 +416,7 @@ pgarch_ArchiverCopyLoop(void)
 			 * we'll adopt a new setting for archive_command as soon as
 			 * possible, even if there is a backlog of files to be archived.
 			 */
-			HandlePgArchInterrupts();
+			ProcessPgArchInterrupts();
 
 			/* Reset variables that might be set by the callback */
 			arch_module_check_errdetail_string = NULL;
@@ -568,6 +569,7 @@ pgarch_archiveXlog(char *xlog)
 		LWLockReleaseAll();
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
+		pgaio_error_cleanup();
 		ReleaseAuxProcessResources(false);
 		AtEOXact_Files(false);
 		AtEOXact_HashTables(false);
@@ -716,15 +718,15 @@ pgarch_readyXlog(char *xlog)
 		/*
 		 * Store the file in our max-heap if it has a high enough priority.
 		 */
-		if (arch_files->arch_heap->bh_size < NUM_FILES_PER_DIRECTORY_SCAN)
+		if (binaryheap_size(arch_files->arch_heap) < NUM_FILES_PER_DIRECTORY_SCAN)
 		{
 			/* If the heap isn't full yet, quickly add it. */
-			arch_file = arch_files->arch_filenames[arch_files->arch_heap->bh_size];
+			arch_file = arch_files->arch_filenames[binaryheap_size(arch_files->arch_heap)];
 			strcpy(arch_file, basename);
 			binaryheap_add_unordered(arch_files->arch_heap, CStringGetDatum(arch_file));
 
 			/* If we just filled the heap, make it a valid one. */
-			if (arch_files->arch_heap->bh_size == NUM_FILES_PER_DIRECTORY_SCAN)
+			if (binaryheap_size(arch_files->arch_heap) == NUM_FILES_PER_DIRECTORY_SCAN)
 				binaryheap_build(arch_files->arch_heap);
 		}
 		else if (ready_file_comparator(binaryheap_first(arch_files->arch_heap),
@@ -742,21 +744,21 @@ pgarch_readyXlog(char *xlog)
 	FreeDir(rldir);
 
 	/* If no files were found, simply return. */
-	if (arch_files->arch_heap->bh_size == 0)
+	if (binaryheap_empty(arch_files->arch_heap))
 		return false;
 
 	/*
 	 * If we didn't fill the heap, we didn't make it a valid one.  Do that
 	 * now.
 	 */
-	if (arch_files->arch_heap->bh_size < NUM_FILES_PER_DIRECTORY_SCAN)
+	if (binaryheap_size(arch_files->arch_heap) < NUM_FILES_PER_DIRECTORY_SCAN)
 		binaryheap_build(arch_files->arch_heap);
 
 	/*
 	 * Fill arch_files array with the files to archive in ascending order of
 	 * priority.
 	 */
-	arch_files->arch_files_size = arch_files->arch_heap->bh_size;
+	arch_files->arch_files_size = binaryheap_size(arch_files->arch_heap);
 	for (int i = 0; i < arch_files->arch_files_size; i++)
 		arch_files->arch_files[i] = DatumGetCString(binaryheap_remove_first(arch_files->arch_heap));
 
@@ -856,7 +858,7 @@ pgarch_die(int code, Datum arg)
  * shutdown request is different between those loops.
  */
 static void
-HandlePgArchInterrupts(void)
+ProcessPgArchInterrupts(void)
 {
 	if (ProcSignalBarrierPending)
 		ProcessProcSignalBarrier();

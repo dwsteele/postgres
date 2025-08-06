@@ -21,6 +21,13 @@
 #define PG_REPLSLOT_DIR     "pg_replslot"
 
 /*
+ * The reserved name for a replication slot used to retain dead tuples for
+ * conflict detection in logical replication. See
+ * maybe_advance_nonremovable_xid() for detail.
+ */
+#define CONFLICT_DETECTION_SLOT "pg_conflict_detection"
+
+/*
  * Behaviour of replication slots, upon release or crash.
  *
  * Slots marked as PERSISTENT are crash-safe and will not be dropped when
@@ -44,21 +51,25 @@ typedef enum ReplicationSlotPersistency
  * Slots can be invalidated, e.g. due to max_slot_wal_keep_size. If so, the
  * 'invalidated' field is set to a value other than _NONE.
  *
- * When adding a new invalidation cause here, remember to update
- * SlotInvalidationCauses and RS_INVAL_MAX_CAUSES.
+ * When adding a new invalidation cause here, the value must be powers of 2
+ * (e.g., 1, 2, 4...) for proper bitwise operations. Also, remember to update
+ * RS_INVAL_MAX_CAUSES below, and SlotInvalidationCauses in slot.c.
  */
 typedef enum ReplicationSlotInvalidationCause
 {
-	RS_INVAL_NONE,
+	RS_INVAL_NONE = 0,
 	/* required WAL has been removed */
-	RS_INVAL_WAL_REMOVED,
+	RS_INVAL_WAL_REMOVED = (1 << 0),
 	/* required rows have been removed */
-	RS_INVAL_HORIZON,
+	RS_INVAL_HORIZON = (1 << 1),
 	/* wal_level insufficient for slot */
-	RS_INVAL_WAL_LEVEL,
+	RS_INVAL_WAL_LEVEL = (1 << 2),
+	/* idle slot timeout has occurred */
+	RS_INVAL_IDLE_TIMEOUT = (1 << 3),
 } ReplicationSlotInvalidationCause;
 
-extern PGDLLIMPORT const char *const SlotInvalidationCauses[];
+/* Maximum number of invalidation causes */
+#define	RS_INVAL_MAX_CAUSES 4
 
 /*
  * On-Disk data of a replication slot, preserved across restarts.
@@ -211,6 +222,33 @@ typedef struct ReplicationSlot
 	 * recently stopped.
 	 */
 	TimestampTz inactive_since;
+
+	/*
+	 * Latest restart_lsn that has been flushed to disk. For persistent slots
+	 * the flushed LSN should be taken into account when calculating the
+	 * oldest LSN for WAL segments removal.
+	 *
+	 * Do not assume that restart_lsn will always move forward, i.e., that the
+	 * previously flushed restart_lsn is always behind data.restart_lsn. In
+	 * streaming replication using a physical slot, the restart_lsn is updated
+	 * based on the flushed WAL position reported by the walreceiver.
+	 *
+	 * This replication mode allows duplicate WAL records to be received and
+	 * overwritten. If the walreceiver receives older WAL records and then
+	 * reports them as flushed to the walsender, the restart_lsn may appear to
+	 * move backward.
+	 *
+	 * This typically occurs at the beginning of replication. One reason is
+	 * that streaming replication starts at the beginning of a segment, so, if
+	 * restart_lsn is in the middle of a segment, it will be updated to an
+	 * earlier LSN, see RequestXLogStreaming. Another reason is that the
+	 * walreceiver chooses its startpoint based on the replayed LSN, so, if
+	 * some records have been received but not yet applied, they will be
+	 * received again and leads to updating the restart_lsn to an earlier
+	 * position.
+	 */
+	XLogRecPtr	last_saved_restart_lsn;
+
 } ReplicationSlot;
 
 #define SlotIsPhysical(slot) ((slot)->data.database == InvalidOid)
@@ -229,6 +267,23 @@ typedef struct ReplicationSlotCtlData
 } ReplicationSlotCtlData;
 
 /*
+ * Set slot's inactive_since property unless it was previously invalidated.
+ */
+static inline void
+ReplicationSlotSetInactiveSince(ReplicationSlot *s, TimestampTz ts,
+								bool acquire_lock)
+{
+	if (acquire_lock)
+		SpinLockAcquire(&s->mutex);
+
+	if (s->data.invalidated == RS_INVAL_NONE)
+		s->inactive_since = ts;
+
+	if (acquire_lock)
+		SpinLockRelease(&s->mutex);
+}
+
+/*
  * Pointers to shared memory
  */
 extern PGDLLIMPORT ReplicationSlotCtlData *ReplicationSlotCtl;
@@ -237,6 +292,7 @@ extern PGDLLIMPORT ReplicationSlot *MyReplicationSlot;
 /* GUCs */
 extern PGDLLIMPORT int max_replication_slots;
 extern PGDLLIMPORT char *synchronized_standby_slots;
+extern PGDLLIMPORT int idle_replication_slot_timeout_secs;
 
 /* shmem initialization functions */
 extern Size ReplicationSlotsShmemSize(void);
@@ -253,7 +309,8 @@ extern void ReplicationSlotDropAcquired(void);
 extern void ReplicationSlotAlter(const char *name, const bool *failover,
 								 const bool *two_phase);
 
-extern void ReplicationSlotAcquire(const char *name, bool nowait);
+extern void ReplicationSlotAcquire(const char *name, bool nowait,
+								   bool error_if_invalid);
 extern void ReplicationSlotRelease(void);
 extern void ReplicationSlotCleanup(bool synced_only);
 extern void ReplicationSlotSave(void);
@@ -261,14 +318,16 @@ extern void ReplicationSlotMarkDirty(void);
 
 /* misc stuff */
 extern void ReplicationSlotInitialize(void);
-extern bool ReplicationSlotValidateName(const char *name, int elevel);
+extern bool ReplicationSlotValidateName(const char *name,
+										bool allow_reserved_name,
+										int elevel);
 extern void ReplicationSlotReserveWal(void);
 extern void ReplicationSlotsComputeRequiredXmin(bool already_locked);
 extern void ReplicationSlotsComputeRequiredLSN(void);
 extern XLogRecPtr ReplicationSlotsComputeLogicalRestartLSN(void);
 extern bool ReplicationSlotsCountDBSlots(Oid dboid, int *nslots, int *nactive);
 extern void ReplicationSlotsDropDBSlots(Oid dboid);
-extern bool InvalidateObsoleteReplicationSlots(ReplicationSlotInvalidationCause cause,
+extern bool InvalidateObsoleteReplicationSlots(uint32 possible_causes,
 											   XLogSegNo oldestSegno,
 											   Oid dboid,
 											   TransactionId snapshotConflictHorizon);
@@ -284,7 +343,8 @@ extern void CheckPointReplicationSlots(bool is_shutdown);
 extern void CheckSlotRequirements(void);
 extern void CheckSlotPermissions(void);
 extern ReplicationSlotInvalidationCause
-			GetSlotInvalidationCause(const char *invalidation_reason);
+			GetSlotInvalidationCause(const char *cause_name);
+extern const char *GetSlotInvalidationCauseName(ReplicationSlotInvalidationCause cause);
 
 extern bool SlotExistsInSyncStandbySlots(const char *slot_name);
 extern bool StandbySlotsHaveCaughtup(XLogRecPtr wait_for_lsn, int elevel);

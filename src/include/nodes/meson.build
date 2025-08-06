@@ -8,6 +8,7 @@ node_support_input_i = [
   'nodes/plannodes.h',
   'nodes/execnodes.h',
   'access/amapi.h',
+  'access/cmptype.h',
   'access/sdir.h',
   'access/tableam.h',
   'access/tsmapi.h',
@@ -27,7 +28,7 @@ node_support_input_i = [
 
 node_support_input = []
 foreach i : node_support_input_i
-  node_support_input += meson.source_root() / 'src' / 'include' / i
+  node_support_input += meson.project_source_root() / 'src' / 'include' / i
 endforeach
 
 node_support_output = [

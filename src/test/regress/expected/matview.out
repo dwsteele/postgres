@@ -587,7 +587,7 @@ CREATE MATERIALIZED VIEW drop_idx_matview AS
 NOTICE:  index "mvtest_drop_idx" does not exist, skipping
 CREATE UNIQUE INDEX mvtest_drop_idx ON drop_idx_matview (i);
 REFRESH MATERIALIZED VIEW CONCURRENTLY drop_idx_matview;
-ERROR:  could not find suitable unique index on materialized view
+ERROR:  could not find suitable unique index on materialized view "drop_idx_matview"
 DROP MATERIALIZED VIEW drop_idx_matview; -- clean up
 RESET search_path;
 -- make sure that create WITH NO DATA works via SPI
@@ -627,10 +627,10 @@ CREATE MATERIALIZED VIEW matview_schema.mv_withdata1 (a) AS
 EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF)
   CREATE MATERIALIZED VIEW matview_schema.mv_withdata2 (a) AS
   SELECT generate_series(1, 10) WITH DATA;
-              QUERY PLAN              
---------------------------------------
- ProjectSet (actual rows=10 loops=1)
-   ->  Result (actual rows=1 loops=1)
+               QUERY PLAN                
+-----------------------------------------
+ ProjectSet (actual rows=10.00 loops=1)
+   ->  Result (actual rows=1.00 loops=1)
 (2 rows)
 
 REFRESH MATERIALIZED VIEW matview_schema.mv_withdata2;

@@ -30,7 +30,6 @@
 #include "access/xact.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
-#include "catalog/pg_proc.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -46,7 +45,6 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/rangetypes.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/ruleutils.h"
@@ -74,12 +72,13 @@
 /* these queries are executed against the FK (referencing) table: */
 #define RI_PLAN_CASCADE_ONDELETE		3
 #define RI_PLAN_CASCADE_ONUPDATE		4
+#define RI_PLAN_NO_ACTION				5
 /* For RESTRICT, the same plan can be used for both ON DELETE and ON UPDATE triggers. */
-#define RI_PLAN_RESTRICT				5
-#define RI_PLAN_SETNULL_ONDELETE		6
-#define RI_PLAN_SETNULL_ONUPDATE		7
-#define RI_PLAN_SETDEFAULT_ONDELETE		8
-#define RI_PLAN_SETDEFAULT_ONUPDATE		9
+#define RI_PLAN_RESTRICT				6
+#define RI_PLAN_SETNULL_ONDELETE		7
+#define RI_PLAN_SETNULL_ONUPDATE		8
+#define RI_PLAN_SETDEFAULT_ONDELETE		9
+#define RI_PLAN_SETDEFAULT_ONUPDATE		10
 
 #define MAX_QUOTED_NAME_LEN  (NAMEDATALEN*2+3)
 #define MAX_QUOTED_REL_NAME_LEN  (MAX_QUOTED_NAME_LEN*2)
@@ -234,10 +233,10 @@ static bool ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 static void ri_ExtractValues(Relation rel, TupleTableSlot *slot,
 							 const RI_ConstraintInfo *riinfo, bool rel_is_pk,
 							 Datum *vals, char *nulls);
-static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
-							   Relation pk_rel, Relation fk_rel,
-							   TupleTableSlot *violatorslot, TupleDesc tupdesc,
-							   int queryno, bool is_restrict, bool partgone) pg_attribute_noreturn();
+pg_noreturn static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
+										   Relation pk_rel, Relation fk_rel,
+										   TupleTableSlot *violatorslot, TupleDesc tupdesc,
+										   int queryno, bool is_restrict, bool partgone);
 
 
 /*
@@ -427,13 +426,13 @@ RI_FKey_check(TriggerData *trigdata)
 		{
 			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]);
 
-			appendStringInfo(&querybuf, ") x1 HAVING ");
+			appendStringInfoString(&querybuf, ") x1 HAVING ");
 			sprintf(paramname, "$%d", riinfo->nkeys);
 			ri_GenerateQual(&querybuf, "",
 							paramname, fk_type,
 							riinfo->agged_period_contained_by_oper,
 							"pg_catalog.range_agg", ANYMULTIRANGEOID);
-			appendStringInfo(&querybuf, "(x1.r)");
+			appendStringInfoString(&querybuf, "(x1.r)");
 		}
 
 		/* Prepare and save the plan */
@@ -596,13 +595,13 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 		{
 			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]);
 
-			appendStringInfo(&querybuf, ") x1 HAVING ");
+			appendStringInfoString(&querybuf, ") x1 HAVING ");
 			sprintf(paramname, "$%d", riinfo->nkeys);
 			ri_GenerateQual(&querybuf, "",
 							paramname, fk_type,
 							riinfo->agged_period_contained_by_oper,
 							"pg_catalog.range_agg", ANYMULTIRANGEOID);
-			appendStringInfo(&querybuf, "(x1.r)");
+			appendStringInfoString(&querybuf, "(x1.r)");
 		}
 
 		/* Prepare and save the plan */
@@ -752,7 +751,7 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 	 * Fetch or prepare a saved plan for the restrict lookup (it's the same
 	 * query for delete and update cases)
 	 */
-	ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_RESTRICT);
+	ri_BuildQueryKey(&qkey, riinfo, is_no_action ? RI_PLAN_NO_ACTION : RI_PLAN_RESTRICT);
 
 	if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
 	{
@@ -837,12 +836,12 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 
 			/* Intersect the fk with the old pk range */
 			initStringInfo(&intersectbuf);
-			appendStringInfoString(&intersectbuf, "(");
+			appendStringInfoChar(&intersectbuf, '(');
 			ri_GenerateQual(&intersectbuf, "",
 							attname, fk_period_type,
 							riinfo->period_intersect_oper,
 							paramname, pk_period_type);
-			appendStringInfoString(&intersectbuf, ")");
+			appendStringInfoChar(&intersectbuf, ')');
 
 			/* Find the remaining history */
 			initStringInfo(&replacementsbuf);

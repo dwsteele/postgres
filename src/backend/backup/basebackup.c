@@ -1045,7 +1045,7 @@ SendBaseBackup(BaseBackupCmd *cmd, IncrementalBackupInfo *ib)
 		sink = bbsink_zstd_new(sink, &opt.compression_specification);
 
 	/* Set up progress reporting. */
-	sink = bbsink_progress_new(sink, opt.progress);
+	sink = bbsink_progress_new(sink, opt.progress, opt.incremental);
 
 	/*
 	 * Perform the base backup, but make sure we clean up the bbsink even if
@@ -1346,7 +1346,7 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
 		snprintf(pathbuf, sizeof(pathbuf), "%s/%s", path, de->d_name);
 
 		/* Skip pg_control here to back up it last */
-		if (strcmp(pathbuf, "./global/pg_control") == 0)
+		if (strcmp(pathbuf, "./" XLOG_CONTROL_FILE) == 0)
 			continue;
 
 		if (lstat(pathbuf, &statbuf) != 0)
@@ -1814,6 +1814,7 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 							   checksum_failures,
 							   readfilename, checksum_failures)));
 
+		pgstat_prepare_report_checksum_failure(dboid);
 		pgstat_report_checksum_failures_in_db(dboid, checksum_failures);
 	}
 

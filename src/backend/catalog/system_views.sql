@@ -658,6 +658,22 @@ GRANT SELECT ON pg_shmem_allocations TO pg_read_all_stats;
 REVOKE EXECUTE ON FUNCTION pg_get_shmem_allocations() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_get_shmem_allocations() TO pg_read_all_stats;
 
+CREATE VIEW pg_shmem_allocations_numa AS
+    SELECT * FROM pg_get_shmem_allocations_numa();
+
+REVOKE ALL ON pg_shmem_allocations_numa FROM PUBLIC;
+GRANT SELECT ON pg_shmem_allocations_numa TO pg_read_all_stats;
+REVOKE EXECUTE ON FUNCTION pg_get_shmem_allocations_numa() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_get_shmem_allocations_numa() TO pg_read_all_stats;
+
+CREATE VIEW pg_dsm_registry_allocations AS
+    SELECT * FROM pg_get_dsm_registry_allocations();
+
+REVOKE ALL ON pg_dsm_registry_allocations FROM PUBLIC;
+GRANT SELECT ON pg_dsm_registry_allocations TO pg_read_all_stats;
+REVOKE EXECUTE ON FUNCTION pg_get_dsm_registry_allocations() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_get_dsm_registry_allocations() TO pg_read_all_stats;
+
 CREATE VIEW pg_backend_memory_contexts AS
     SELECT * FROM pg_get_backend_memory_contexts();
 
@@ -696,7 +712,11 @@ CREATE VIEW pg_stat_all_tables AS
             pg_stat_get_vacuum_count(C.oid) AS vacuum_count,
             pg_stat_get_autovacuum_count(C.oid) AS autovacuum_count,
             pg_stat_get_analyze_count(C.oid) AS analyze_count,
-            pg_stat_get_autoanalyze_count(C.oid) AS autoanalyze_count
+            pg_stat_get_autoanalyze_count(C.oid) AS autoanalyze_count,
+            pg_stat_get_total_vacuum_time(C.oid) AS total_vacuum_time,
+            pg_stat_get_total_autovacuum_time(C.oid) AS total_autovacuum_time,
+            pg_stat_get_total_analyze_time(C.oid) AS total_analyze_time,
+            pg_stat_get_total_autoanalyze_time(C.oid) AS total_autoanalyze_time
     FROM pg_class C LEFT JOIN
          pg_index I ON C.oid = I.indrelid
          LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
@@ -883,7 +903,7 @@ CREATE VIEW pg_stat_activity AS
             S.wait_event,
             S.state,
             S.backend_xid,
-            s.backend_xmin,
+            S.backend_xmin,
             S.query_id,
             S.query,
             S.backend_type
@@ -1021,6 +1041,7 @@ CREATE VIEW pg_replication_slots AS
             L.wal_status,
             L.safe_wal_size,
             L.two_phase,
+            L.two_phase_at,
             L.inactive_since,
             L.conflicting,
             L.invalidation_reason,
@@ -1185,10 +1206,6 @@ CREATE VIEW pg_stat_wal AS
         w.wal_fpi,
         w.wal_bytes,
         w.wal_buffers_full,
-        w.wal_write,
-        w.wal_sync,
-        w.wal_write_time,
-        w.wal_sync_time,
         w.stats_reset
     FROM pg_stat_get_wal() w;
 
@@ -1209,7 +1226,8 @@ CREATE VIEW pg_stat_progress_analyze AS
         S.param5 AS ext_stats_computed,
         S.param6 AS child_tables_total,
         S.param7 AS child_tables_done,
-        CAST(S.param8 AS oid) AS current_child_table_relid
+        CAST(S.param8 AS oid) AS current_child_table_relid,
+        S.param9 / 1000000::double precision AS delay_time
     FROM pg_stat_get_progress_info('ANALYZE') AS S
         LEFT JOIN pg_database D ON S.datid = D.oid;
 
@@ -1229,7 +1247,8 @@ CREATE VIEW pg_stat_progress_vacuum AS
         S.param4 AS heap_blks_vacuumed, S.param5 AS index_vacuum_count,
         S.param6 AS max_dead_tuple_bytes, S.param7 AS dead_tuple_bytes,
         S.param8 AS num_dead_item_ids, S.param9 AS indexes_total,
-        S.param10 AS indexes_processed
+        S.param10 AS indexes_processed,
+        S.param11 / 1000000::double precision AS delay_time
     FROM pg_stat_get_progress_info('VACUUM') AS S
         LEFT JOIN pg_database D ON S.datid = D.oid;
 
@@ -1308,7 +1327,10 @@ CREATE VIEW pg_stat_progress_basebackup AS
         CASE S.param2 WHEN -1 THEN NULL ELSE S.param2 END AS backup_total,
         S.param3 AS backup_streamed,
         S.param4 AS tablespaces_total,
-        S.param5 AS tablespaces_streamed
+        S.param5 AS tablespaces_streamed,
+        CASE S.param6 WHEN 1 THEN 'full'
+                      WHEN 2 THEN 'incremental'
+                      END AS backup_type
     FROM pg_stat_get_progress_info('BASEBACKUP') AS S;
 
 
@@ -1367,7 +1389,8 @@ REVOKE ALL ON pg_subscription FROM public;
 GRANT SELECT (oid, subdbid, subskiplsn, subname, subowner, subenabled,
               subbinary, substream, subtwophasestate, subdisableonerr,
 			  subpasswordrequired, subrunasowner, subfailover,
-              subslotname, subsynccommit, subpublications, suborigin)
+			  subretaindeadtuples, subslotname, subsynccommit,
+			  subpublications, suborigin)
     ON pg_subscription TO public;
 
 CREATE VIEW pg_stat_subscription_stats AS
@@ -1379,12 +1402,21 @@ CREATE VIEW pg_stat_subscription_stats AS
         ss.confl_insert_exists,
         ss.confl_update_origin_differs,
         ss.confl_update_exists,
+        ss.confl_update_deleted,
         ss.confl_update_missing,
         ss.confl_delete_origin_differs,
         ss.confl_delete_missing,
+        ss.confl_multiple_unique_conflicts,
         ss.stats_reset
     FROM pg_subscription as s,
          pg_stat_get_subscription_stats(s.oid) as ss;
 
 CREATE VIEW pg_wait_events AS
     SELECT * FROM pg_get_wait_events();
+
+CREATE VIEW pg_aios AS
+    SELECT * FROM pg_get_aios();
+REVOKE ALL ON pg_aios FROM PUBLIC;
+GRANT SELECT ON pg_aios TO pg_read_all_stats;
+REVOKE EXECUTE ON FUNCTION pg_get_aios() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_get_aios() TO pg_read_all_stats;

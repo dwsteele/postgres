@@ -522,15 +522,15 @@ select * from (select * from t order by a) s order by a, b limit 55;
 select explain_analyze_without_memory('select * from (select * from t order by a) s order by a, b limit 55');
                                         explain_analyze_without_memory                                         
 ---------------------------------------------------------------------------------------------------------------
- Limit (actual rows=55 loops=1)
-   ->  Incremental Sort (actual rows=55 loops=1)
+ Limit (actual rows=55.00 loops=1)
+   ->  Incremental Sort (actual rows=55.00 loops=1)
          Sort Key: t.a, t.b
          Presorted Key: t.a
          Full-sort Groups: 2  Sort Methods: top-N heapsort, quicksort  Average Memory: NNkB  Peak Memory: NNkB
-         ->  Sort (actual rows=101 loops=1)
+         ->  Sort (actual rows=101.00 loops=1)
                Sort Key: t.a
                Sort Method: quicksort  Memory: NNkB
-               ->  Seq Scan on t (actual rows=1000 loops=1)
+               ->  Seq Scan on t (actual rows=1000.00 loops=1)
 (9 rows)
 
 select jsonb_pretty(explain_analyze_inc_sort_nodes_without_memory('select * from (select * from t order by a) s order by a, b limit 55'));
@@ -544,7 +544,7 @@ select jsonb_pretty(explain_analyze_inc_sort_nodes_without_memory('select * from
              "t.b"                              +
          ],                                     +
          "Node Type": "Incremental Sort",       +
-         "Actual Rows": 55,                     +
+         "Actual Rows": 55.00,                  +
          "Actual Loops": 1,                     +
          "Async Capable": false,                +
          "Presorted Key": [                     +
@@ -726,16 +726,16 @@ rollback;
 select explain_analyze_without_memory('select * from (select * from t order by a) s order by a, b limit 70');
                                          explain_analyze_without_memory                                         
 ----------------------------------------------------------------------------------------------------------------
- Limit (actual rows=70 loops=1)
-   ->  Incremental Sort (actual rows=70 loops=1)
+ Limit (actual rows=70.00 loops=1)
+   ->  Incremental Sort (actual rows=70.00 loops=1)
          Sort Key: t.a, t.b
          Presorted Key: t.a
          Full-sort Groups: 1  Sort Method: quicksort  Average Memory: NNkB  Peak Memory: NNkB
          Pre-sorted Groups: 5  Sort Methods: top-N heapsort, quicksort  Average Memory: NNkB  Peak Memory: NNkB
-         ->  Sort (actual rows=1000 loops=1)
+         ->  Sort (actual rows=1000.00 loops=1)
                Sort Key: t.a
                Sort Method: quicksort  Memory: NNkB
-               ->  Seq Scan on t (actual rows=1000 loops=1)
+               ->  Seq Scan on t (actual rows=1000.00 loops=1)
 (10 rows)
 
 select jsonb_pretty(explain_analyze_inc_sort_nodes_without_memory('select * from (select * from t order by a) s order by a, b limit 70'));
@@ -749,7 +749,7 @@ select jsonb_pretty(explain_analyze_inc_sort_nodes_without_memory('select * from
              "t.b"                              +
          ],                                     +
          "Node Type": "Incremental Sort",       +
-         "Actual Rows": 70,                     +
+         "Actual Rows": 70.00,                  +
          "Actual Loops": 1,                     +
          "Async Capable": false,                +
          "Presorted Key": [                     +
@@ -1722,3 +1722,43 @@ order by t1.four, t1.two limit 1;
                ->  Seq Scan on tenk1 t2
 (12 rows)
 
+--
+-- Test incremental sort for Append/MergeAppend
+--
+create table prt_tbl (a int, b int) partition by range (a);
+create table prt_tbl_1 partition of prt_tbl for values from (0) to (100);
+create table prt_tbl_2 partition of prt_tbl for values from (100) to (200);
+insert into prt_tbl select i%200, i from generate_series(1,1000)i;
+create index on prt_tbl_1(a);
+create index on prt_tbl_2(a, b);
+analyze prt_tbl;
+set enable_seqscan to off;
+set enable_bitmapscan to off;
+-- Ensure we get an incremental sort for the subpath of Append
+explain (costs off) select * from prt_tbl order by a, b;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Append
+   ->  Incremental Sort
+         Sort Key: prt_tbl_1.a, prt_tbl_1.b
+         Presorted Key: prt_tbl_1.a
+         ->  Index Scan using prt_tbl_1_a_idx on prt_tbl_1
+   ->  Index Only Scan using prt_tbl_2_a_b_idx on prt_tbl_2
+(6 rows)
+
+-- Ensure we get an incremental sort for the subpath of MergeAppend
+explain (costs off) select * from prt_tbl_1 union all select * from prt_tbl_2 order by a, b;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Merge Append
+   Sort Key: prt_tbl_1.a, prt_tbl_1.b
+   ->  Incremental Sort
+         Sort Key: prt_tbl_1.a, prt_tbl_1.b
+         Presorted Key: prt_tbl_1.a
+         ->  Index Scan using prt_tbl_1_a_idx on prt_tbl_1
+   ->  Index Only Scan using prt_tbl_2_a_b_idx on prt_tbl_2
+(7 rows)
+
+reset enable_bitmapscan;
+reset enable_seqscan;
+drop table prt_tbl;

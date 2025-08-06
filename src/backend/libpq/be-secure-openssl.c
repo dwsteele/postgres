@@ -821,7 +821,7 @@ be_tls_read(Port *port, void *ptr, size_t len, int *waitfor)
 }
 
 ssize_t
-be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
+be_tls_write(Port *port, const void *ptr, size_t len, int *waitfor)
 {
 	ssize_t		n;
 	int			err;
@@ -1436,10 +1436,10 @@ initialize_ecdh(SSL_CTX *context, bool isServerStart)
 		 */
 		ereport(isServerStart ? FATAL : LOG,
 				errcode(ERRCODE_CONFIG_FILE_ERROR),
-				errmsg("failed to set group names specified in ssl_groups: %s",
+				errmsg("could not set group names specified in ssl_groups: %s",
 					   SSLerrmessageExt(ERR_get_error(),
 										_("No valid groups found"))),
-				errhint("Ensure that each group name is spelled correctly and supported by the installed version of OpenSSL"));
+				errhint("Ensure that each group name is spelled correctly and supported by the installed version of OpenSSL."));
 		return false;
 	}
 #endif

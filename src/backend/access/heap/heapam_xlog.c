@@ -438,6 +438,9 @@ heap_xlog_insert(XLogReaderState *record)
 	ItemPointerSetBlockNumber(&target_tid, blkno);
 	ItemPointerSetOffsetNumber(&target_tid, xlrec->offnum);
 
+	/* No freezing in the heap_insert() code path */
+	Assert(!(xlrec->flags & XLH_INSERT_ALL_FROZEN_SET));
+
 	/*
 	 * The visibility map may need to be fixed even if the heap page is
 	 * already up-to-date.
@@ -480,11 +483,11 @@ heap_xlog_insert(XLogReaderState *record)
 
 		newlen = datalen - SizeOfHeapHeader;
 		Assert(datalen > SizeOfHeapHeader && newlen <= MaxHeapTupleSize);
-		memcpy((char *) &xlhdr, data, SizeOfHeapHeader);
+		memcpy(&xlhdr, data, SizeOfHeapHeader);
 		data += SizeOfHeapHeader;
 
 		htup = &tbuf.hdr;
-		MemSet((char *) htup, 0, SizeofHeapTupleHeader);
+		MemSet(htup, 0, SizeofHeapTupleHeader);
 		/* PG73FORMAT: get bitmap [+ padding] [+ oid] + data */
 		memcpy((char *) htup + SizeofHeapTupleHeader,
 			   data,
@@ -507,10 +510,6 @@ heap_xlog_insert(XLogReaderState *record)
 
 		if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
 			PageClearAllVisible(page);
-
-		/* XLH_INSERT_ALL_FROZEN_SET implies that all tuples are visible */
-		if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
-			PageSetAllVisible(page);
 
 		MarkBufferDirty(buffer);
 	}
@@ -625,10 +624,10 @@ heap_xlog_multi_insert(XLogReaderState *record)
 			newlen = xlhdr->datalen;
 			Assert(newlen <= MaxHeapTupleSize);
 			htup = &tbuf.hdr;
-			MemSet((char *) htup, 0, SizeofHeapTupleHeader);
+			MemSet(htup, 0, SizeofHeapTupleHeader);
 			/* PG73FORMAT: get bitmap [+ padding] [+ oid] + data */
 			memcpy((char *) htup + SizeofHeapTupleHeader,
-				   (char *) tupdata,
+				   tupdata,
 				   newlen);
 			tupdata += newlen;
 
@@ -854,14 +853,14 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 			recdata += sizeof(uint16);
 		}
 
-		memcpy((char *) &xlhdr, recdata, SizeOfHeapHeader);
+		memcpy(&xlhdr, recdata, SizeOfHeapHeader);
 		recdata += SizeOfHeapHeader;
 
 		tuplen = recdata_end - recdata;
 		Assert(tuplen <= MaxHeapTupleSize);
 
 		htup = &tbuf.hdr;
-		MemSet((char *) htup, 0, SizeofHeapTupleHeader);
+		MemSet(htup, 0, SizeofHeapTupleHeader);
 
 		/*
 		 * Reconstruct the new tuple using the prefix and/or suffix from the

@@ -312,19 +312,9 @@ typedef struct xl_end_of_recovery
 typedef struct XLogRecData
 {
 	struct XLogRecData *next;	/* next struct in chain, or NULL */
-	const char *data;			/* start of rmgr data to include */
+	const void *data;			/* start of rmgr data to include */
 	uint32		len;			/* length of rmgr data to include */
 } XLogRecData;
-
-/*
- * Recovery target action.
- */
-typedef enum
-{
-	RECOVERY_TARGET_ACTION_PAUSE,
-	RECOVERY_TARGET_ACTION_PROMOTE,
-	RECOVERY_TARGET_ACTION_SHUTDOWN,
-}			RecoveryTargetAction;
 
 struct LogicalDecodingContext;
 struct XLogRecordBuffer;

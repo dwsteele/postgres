@@ -97,7 +97,7 @@ typedef pg_atomic_uint64 dsa_pointer_atomic;
 #define DSA_DEFAULT_INIT_SEGMENT_SIZE ((size_t) (1 * 1024 * 1024))
 
 /* The minimum size of a DSM segment. */
-#define DSA_MIN_SEGMENT_SIZE	((size_t) (256 * 1024L))
+#define DSA_MIN_SEGMENT_SIZE	((size_t) (256 * 1024))
 
 /* The maximum size of a DSM segment. */
 #define DSA_MAX_SEGMENT_SIZE ((size_t) 1 << DSA_OFFSET_WIDTH)
@@ -145,6 +145,7 @@ extern dsa_area *dsa_create_in_place_ext(void *place, size_t size,
 										 size_t init_segment_size,
 										 size_t max_segment_size);
 extern dsa_area *dsa_attach(dsa_handle handle);
+extern bool dsa_is_attached(dsa_handle handle);
 extern dsa_area *dsa_attach_in_place(void *place, dsm_segment *segment);
 extern void dsa_release_in_place(void *place);
 extern void dsa_on_dsm_detach_release_in_place(dsm_segment *, Datum);

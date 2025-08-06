@@ -183,7 +183,7 @@ StatsShmemInit(void)
 		p += MAXALIGN(pgstat_dsa_init_size());
 		dsa = dsa_create_in_place(ctl->raw_dsa_area,
 								  pgstat_dsa_init_size(),
-								  LWTRANCHE_PGSTATS_DSA, 0);
+								  LWTRANCHE_PGSTATS_DSA, NULL);
 		dsa_pin(dsa);
 
 		/*
@@ -255,7 +255,8 @@ pgstat_attach_shmem(void)
 	dsa_pin_mapping(pgStatLocal.dsa);
 
 	pgStatLocal.shared_hash = dshash_attach(pgStatLocal.dsa, &dsh_params,
-											pgStatLocal.shmem->hash_handle, 0);
+											pgStatLocal.shmem->hash_handle,
+											NULL);
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -643,6 +644,13 @@ pgstat_release_entry_ref(PgStat_HashKey key, PgStat_EntryRef *entry_ref,
 		pfree(entry_ref);
 }
 
+/*
+ * Acquire exclusive lock on the entry.
+ *
+ * If nowait is true, it's just a conditional acquire, and the result
+ * *must* be checked to verify success.
+ * If nowait is false, waits as necessary, always returning true.
+ */
 bool
 pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait)
 {
@@ -656,8 +664,10 @@ pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait)
 }
 
 /*
+ * Acquire shared lock on the entry.
+ *
  * Separate from pgstat_lock_entry() as most callers will need to lock
- * exclusively.
+ * exclusively.  The wait semantics are identical.
  */
 bool
 pgstat_lock_entry_shared(PgStat_EntryRef *entry_ref, bool nowait)
@@ -864,10 +874,10 @@ pgstat_drop_entry_internal(PgStatShared_HashEntry *shent,
 	 */
 	if (shent->dropped)
 		elog(ERROR,
-			 "trying to drop stats entry already dropped: kind=%s dboid=%u objid=%llu refcount=%u",
+			 "trying to drop stats entry already dropped: kind=%s dboid=%u objid=%" PRIu64 " refcount=%u",
 			 pgstat_get_kind_info(shent->key.kind)->name,
 			 shent->key.dboid,
-			 (unsigned long long) shent->key.objid,
+			 shent->key.objid,
 			 pg_atomic_read_u32(&shent->refcount));
 	shent->dropped = true;
 
@@ -993,18 +1003,38 @@ pgstat_drop_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 	return freed;
 }
 
+/*
+ * Scan through the shared hashtable of stats, dropping statistics if
+ * approved by the optional do_drop() function.
+ */
 void
-pgstat_drop_all_entries(void)
+pgstat_drop_matching_entries(bool (*do_drop) (PgStatShared_HashEntry *, Datum),
+							 Datum match_data)
 {
 	dshash_seq_status hstat;
 	PgStatShared_HashEntry *ps;
 	uint64		not_freed_count = 0;
 
+	/* entries are removed, take an exclusive lock */
 	dshash_seq_init(&hstat, pgStatLocal.shared_hash, true);
 	while ((ps = dshash_seq_next(&hstat)) != NULL)
 	{
 		if (ps->dropped)
 			continue;
+
+		if (do_drop != NULL && !do_drop(ps, match_data))
+			continue;
+
+		/* delete local reference */
+		if (pgStatEntryRefHash)
+		{
+			PgStat_EntryRefHashEntry *lohashent =
+				pgstat_entry_ref_hash_lookup(pgStatEntryRefHash, ps->key);
+
+			if (lohashent)
+				pgstat_release_entry_ref(lohashent->key, lohashent->entry_ref,
+										 true);
+		}
 
 		if (!pgstat_drop_entry_internal(ps, &hstat))
 			not_freed_count++;
@@ -1013,6 +1043,15 @@ pgstat_drop_all_entries(void)
 
 	if (not_freed_count > 0)
 		pgstat_request_entry_refs_gc();
+}
+
+/*
+ * Scan through the shared hashtable of stats and drop all entries.
+ */
+void
+pgstat_drop_all_entries(void)
+{
+	pgstat_drop_matching_entries(NULL, 0);
 }
 
 static void

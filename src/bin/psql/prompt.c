@@ -31,6 +31,7 @@
  *		sockets, "[local:/dir/name]" if not default
  * %m - like %M, but hostname only (before first dot), or always "[local]"
  * %p - backend pid
+ * %P - pipeline status: on, off or abort
  * %> - database server port number
  * %n - database user name
  * %s - service
@@ -168,8 +169,12 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					break;
 					/* service name */
 				case 's':
-					if (pset.db && PQservice(pset.db))
-						strlcpy(buf, PQservice(pset.db), sizeof(buf));
+					{
+						const char *service_name = GetVariable(pset.vars, "SERVICE");
+
+						if (service_name)
+							strlcpy(buf, service_name, sizeof(buf));
+					}
 					break;
 					/* backend pid */
 				case 'p':
@@ -181,6 +186,19 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 							snprintf(buf, sizeof(buf), "%d", pid);
 					}
 					break;
+					/* pipeline status */
+				case 'P':
+					{
+						PGpipelineStatus status = PQpipelineStatus(pset.db);
+
+						if (status == PQ_PIPELINE_ON)
+							strlcpy(buf, "on", sizeof(buf));
+						else if (status == PQ_PIPELINE_ABORTED)
+							strlcpy(buf, "abort", sizeof(buf));
+						else
+							strlcpy(buf, "off", sizeof(buf));
+						break;
+					}
 
 				case '0':
 				case '1':

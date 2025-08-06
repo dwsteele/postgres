@@ -61,6 +61,10 @@ static	bool			tok_is_keyword(int token, union YYSTYPE *lval,
 static	void			word_is_not_variable(PLword *word, int location, yyscan_t yyscanner);
 static	void			cword_is_not_variable(PLcword *cword, int location, yyscan_t yyscanner);
 static	void			current_token_is_not_variable(int tok, YYSTYPE *yylvalp, YYLTYPE *yyllocp, yyscan_t yyscanner);
+static	PLpgSQL_expr	*make_plpgsql_expr(const char *query,
+										   RawParseMode parsemode);
+static	void			mark_expr_as_assignment_source(PLpgSQL_expr *expr,
+													   PLpgSQL_datum *target);
 static	PLpgSQL_expr	*read_sql_construct(int until,
 											int until2,
 											int until3,
@@ -536,6 +540,10 @@ decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull
 									 errmsg("variable \"%s\" must have a default value, since it's declared NOT NULL",
 											var->refname),
 									 parser_errposition(@5)));
+
+						if (var->default_val != NULL)
+							mark_expr_as_assignment_source(var->default_val,
+														   (PLpgSQL_datum *) var);
 					}
 				| decl_varname K_ALIAS K_FOR decl_aliasitem ';'
 					{
@@ -996,6 +1004,7 @@ stmt_assign		: T_DATUM
 													   false, true,
 													   NULL, NULL,
 													   &yylval, &yylloc, yyscanner);
+						mark_expr_as_assignment_source(new->expr, $1.datum);
 
 						$$ = (PLpgSQL_stmt *) new;
 					}
@@ -1359,7 +1368,8 @@ for_control		: for_variable K_IN
 						int			tok = yylex(&yylval, &yylloc, yyscanner);
 						int			tokloc = yylloc;
 
-						if (tok == K_EXECUTE)
+						if (tok_is_keyword(tok, &yylval,
+										   K_EXECUTE, "execute"))
 						{
 							/* EXECUTE means it's a dynamic FOR loop */
 							PLpgSQL_stmt_dynfors *new;
@@ -2126,7 +2136,8 @@ stmt_open		: K_OPEN cursor_variable
 								yyerror(&yylloc, NULL, yyscanner, "syntax error, expected \"FOR\"");
 
 							tok = yylex(&yylval, &yylloc, yyscanner);
-							if (tok == K_EXECUTE)
+							if (tok_is_keyword(tok, &yylval,
+											   K_EXECUTE, "execute"))
 							{
 								int			endtoken;
 
@@ -2318,6 +2329,8 @@ exception_sect	:
 						int			lineno = plpgsql_location_to_lineno(@1, yyscanner);
 						PLpgSQL_exception_block *new = palloc(sizeof(PLpgSQL_exception_block));
 						PLpgSQL_variable *var;
+
+						plpgsql_curr_compile->has_exception_block = true;
 
 						var = plpgsql_build_variable("sqlstate", lineno,
 													 plpgsql_build_datatype(TEXTOID,
@@ -2525,6 +2538,7 @@ unreserved_keyword	:
 				| K_ERRCODE
 				| K_ERROR
 				| K_EXCEPTION
+				| K_EXECUTE
 				| K_EXIT
 				| K_FETCH
 				| K_FIRST
@@ -2570,6 +2584,7 @@ unreserved_keyword	:
 				| K_SLICE
 				| K_SQLSTATE
 				| K_STACKED
+				| K_STRICT
 				| K_TABLE
 				| K_TABLE_NAME
 				| K_TYPE
@@ -2649,6 +2664,51 @@ current_token_is_not_variable(int tok, YYSTYPE *yylvalp, YYLTYPE *yyllocp, yysca
 		cword_is_not_variable(&(yylvalp->cword), *yyllocp, yyscanner);
 	else
 		yyerror(yyllocp, NULL, yyscanner, "syntax error");
+}
+
+/* Convenience routine to construct a PLpgSQL_expr struct */
+static PLpgSQL_expr *
+make_plpgsql_expr(const char *query,
+				  RawParseMode parsemode)
+{
+	PLpgSQL_expr *expr = palloc0(sizeof(PLpgSQL_expr));
+
+	expr->query = pstrdup(query);
+	expr->parseMode = parsemode;
+	expr->func = plpgsql_curr_compile;
+	expr->ns = plpgsql_ns_top();
+	/* might get changed later during parsing: */
+	expr->target_param = -1;
+	expr->target_is_local = false;
+	/* other fields are left as zeroes until first execution */
+	return expr;
+}
+
+/* Mark a PLpgSQL_expr as being the source of an assignment to target */
+static void
+mark_expr_as_assignment_source(PLpgSQL_expr *expr, PLpgSQL_datum *target)
+{
+	/*
+	 * Mark the expression as being an assignment source, if target is a
+	 * simple variable.  We don't currently support optimized assignments to
+	 * other DTYPEs, so no need to mark in other cases.
+	 */
+	if (target->dtype == PLPGSQL_DTYPE_VAR)
+	{
+		expr->target_param = target->dno;
+
+		/*
+		 * For now, assume the target is local to the nearest enclosing
+		 * exception block.  That's correct if the function contains no
+		 * exception blocks; otherwise we'll update this later.
+		 */
+		expr->target_is_local = true;
+	}
+	else
+	{
+		expr->target_param = -1;	/* should be that already */
+		expr->target_is_local = false; /* ditto */
+	}
 }
 
 /* Convenience routine to read an expression with one possible terminator */
@@ -2794,13 +2854,7 @@ read_sql_construct(int until,
 	 */
 	plpgsql_append_source_text(&ds, startlocation, endlocation, yyscanner);
 
-	expr = palloc0(sizeof(PLpgSQL_expr));
-	expr->query = pstrdup(ds.data);
-	expr->parseMode = parsemode;
-	expr->plan = NULL;
-	expr->paramnos = NULL;
-	expr->target_param = -1;
-	expr->ns = plpgsql_ns_top();
+	expr = make_plpgsql_expr(ds.data, parsemode);
 	pfree(ds.data);
 
 	if (valid_sql)
@@ -3122,13 +3176,7 @@ make_execsql_stmt(int firsttoken, int location, PLword *word, YYSTYPE *yylvalp, 
 	while (ds.len > 0 && scanner_isspace(ds.data[ds.len - 1]))
 		ds.data[--ds.len] = '\0';
 
-	expr = palloc0(sizeof(PLpgSQL_expr));
-	expr->query = pstrdup(ds.data);
-	expr->parseMode = RAW_PARSE_DEFAULT;
-	expr->plan = NULL;
-	expr->paramnos = NULL;
-	expr->target_param = -1;
-	expr->ns = plpgsql_ns_top();
+	expr = make_plpgsql_expr(ds.data, RAW_PARSE_DEFAULT);
 	pfree(ds.data);
 
 	check_sql_expr(expr->query, expr->parseMode, location, yyscanner);
@@ -3470,7 +3518,8 @@ make_return_query_stmt(int location, YYSTYPE *yylvalp, YYLTYPE *yyllocp, yyscan_
 	new->stmtid = ++plpgsql_curr_compile->nstatements;
 
 	/* check for RETURN QUERY EXECUTE */
-	if ((tok = yylex(yylvalp, yyllocp, yyscanner)) != K_EXECUTE)
+	tok = yylex(yylvalp, yyllocp, yyscanner);
+	if (!tok_is_keyword(tok, yylvalp, K_EXECUTE, "execute"))
 	{
 		/* ordinary static query */
 		plpgsql_push_back_token(tok, yylvalp, yyllocp, yyscanner);
@@ -3553,7 +3602,7 @@ read_into_target(PLpgSQL_variable **target, bool *strict, YYSTYPE *yylvalp, YYLT
 		*strict = false;
 
 	tok = yylex(yylvalp, yyllocp, yyscanner);
-	if (strict && tok == K_STRICT)
+	if (strict && tok_is_keyword(tok, yylvalp, K_STRICT, "strict"))
 	{
 		*strict = true;
 		tok = yylex(yylvalp, yyllocp, yyscanner);
@@ -3804,6 +3853,7 @@ parse_datatype(const char *string, int location, yyscan_t yyscanner)
 	int32		typmod;
 	sql_error_callback_arg cbarg;
 	ErrorContextCallback syntax_errcontext;
+	MemoryContext oldCxt;
 
 	cbarg.location = location;
 	cbarg.yyscanner = yyscanner;
@@ -3813,9 +3863,14 @@ parse_datatype(const char *string, int location, yyscan_t yyscanner)
 	syntax_errcontext.previous = error_context_stack;
 	error_context_stack = &syntax_errcontext;
 
-	/* Let the main parser try to parse it under standard SQL rules */
+	/*
+	 * Let the main parser try to parse it under standard SQL rules.  The
+	 * parser leaks memory, so run it in temp context.
+	 */
+	oldCxt = MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
 	typeName = typeStringToTypeName(string, NULL);
 	typenameTypeIdAndMod(NULL, typeName, &type_id, &typmod);
+	MemoryContextSwitchTo(oldCxt);
 
 	/* Restore former ereport callback */
 	error_context_stack = syntax_errcontext.previous;
@@ -3911,9 +3966,12 @@ read_cursor_args(PLpgSQL_var *cursor, int until, YYSTYPE *yylvalp, YYLTYPE *yyll
 					tok2;
 		int			arglocation;
 
-		/* Check if it's a named parameter: "param := value" */
+		/*
+		 * Check if it's a named parameter: "param := value"
+		 * or "param => value"
+		 */
 		plpgsql_peek2(&tok1, &tok2, &arglocation, NULL, yyscanner);
-		if (tok1 == IDENT && tok2 == COLON_EQUALS)
+		if (tok1 == IDENT && (tok2 == COLON_EQUALS || tok2 == EQUALS_GREATER))
 		{
 			char	   *argname;
 			IdentifierLookup save_IdentifierLookup;
@@ -3939,11 +3997,11 @@ read_cursor_args(PLpgSQL_var *cursor, int until, YYSTYPE *yylvalp, YYLTYPE *yyll
 						 parser_errposition(*yyllocp)));
 
 			/*
-			 * Eat the ":=". We already peeked, so the error should never
-			 * happen.
+			 * Eat the ":=" or "=>".  We already peeked, so the error should
+			 * never happen.
 			 */
 			tok2 = yylex(yylvalp, yyllocp, yyscanner);
-			if (tok2 != COLON_EQUALS)
+			if (tok2 != COLON_EQUALS && tok2 != EQUALS_GREATER)
 				yyerror(yyllocp, NULL, yyscanner, "syntax error");
 
 			any_named = true;
@@ -4006,13 +4064,7 @@ read_cursor_args(PLpgSQL_var *cursor, int until, YYSTYPE *yylvalp, YYLTYPE *yyll
 			appendStringInfoString(&ds, ", ");
 	}
 
-	expr = palloc0(sizeof(PLpgSQL_expr));
-	expr->query = pstrdup(ds.data);
-	expr->parseMode = RAW_PARSE_PLPGSQL_EXPR;
-	expr->plan = NULL;
-	expr->paramnos = NULL;
-	expr->target_param = -1;
-	expr->ns = plpgsql_ns_top();
+	expr = make_plpgsql_expr(ds.data, RAW_PARSE_PLPGSQL_EXPR);
 	pfree(ds.data);
 
 	/* Next we'd better find the until token */

@@ -213,6 +213,14 @@ ALTER USER MAPPING FOR public SERVER testserver1
 ALTER USER MAPPING FOR public SERVER testserver1
 	OPTIONS (ADD sslkey 'value', ADD sslcert 'value');
 
+-- OAuth options are not allowed in either context
+ALTER SERVER testserver1 OPTIONS (ADD oauth_issuer 'https://example.com');
+ALTER SERVER testserver1 OPTIONS (ADD oauth_client_id 'myID');
+ALTER USER MAPPING FOR public SERVER testserver1
+	OPTIONS (ADD oauth_issuer 'https://example.com');
+ALTER USER MAPPING FOR public SERVER testserver1
+	OPTIONS (ADD oauth_client_id 'myID');
+
 ALTER FOREIGN TABLE ft1 OPTIONS (schema_name 'S 1', table_name 'T 1');
 ALTER FOREIGN TABLE ft2 OPTIONS (schema_name 'S 1', table_name 'T 1');
 ALTER FOREIGN TABLE ft1 ALTER COLUMN c1 OPTIONS (column_name 'C 1');
@@ -344,7 +352,7 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c3 IS NULL;        -- Nu
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c3 IS NOT NULL;    -- NullTest
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE round(abs(c1), 0) = 1; -- FuncExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = -c1;          -- OpExpr(l)
-EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE (c1 IS NOT NULL) IS DISTINCT FROM (c1 IS NOT NULL); -- DistinctExpr
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE (c3 IS NOT NULL) IS DISTINCT FROM (c3 IS NOT NULL); -- DistinctExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = ANY(ARRAY[c2, 1, c1 + 0]); -- ScalarArrayOpExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = (ARRAY[c1,c2,3])[1]; -- SubscriptingRef
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c6 = E'foo''s\\bar';  -- check special chars
@@ -449,6 +457,15 @@ SELECT * FROM ft1 WHERE CASE c3 WHEN c6 THEN true ELSE c3 < 'bar' END;
 -- but this is not because of collation
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT * FROM ft1 WHERE CASE c3 COLLATE "C" WHEN c6 THEN true ELSE c3 < 'bar' END;
+
+-- Test array type conversion pushdown
+SET plan_cache_mode = force_generic_plan;
+PREPARE s(varchar[]) AS SELECT count(*) FROM ft2 WHERE c6 = ANY ($1);
+EXPLAIN (VERBOSE, COSTS OFF)
+EXECUTE s(ARRAY['1','2']);
+EXECUTE s(ARRAY['1','2']);
+DEALLOCATE s;
+RESET plan_cache_mode;
 
 -- a regconfig constant referring to this text search configuration
 -- is initially unshippable
@@ -707,6 +724,11 @@ SELECT * FROM ft1, ft2, ft4, ft5, local_tbl WHERE ft1.c1 = ft2.c1 AND ft1.c2 = f
     AND ft1.c2 = ft5.c1 AND ft1.c2 = local_tbl.c1 AND ft1.c1 < 100 AND ft2.c1 < 100 FOR UPDATE;
 SELECT * FROM ft1, ft2, ft4, ft5, local_tbl WHERE ft1.c1 = ft2.c1 AND ft1.c2 = ft4.c1
     AND ft1.c2 = ft5.c1 AND ft1.c2 = local_tbl.c1 AND ft1.c1 < 100 AND ft2.c1 < 100 FOR UPDATE;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM ft1, ft4, ft5, local_tbl WHERE ft1.c1 = ft4.c1 AND ft1.c1 = ft5.c1
+    AND ft1.c2 = local_tbl.c1 AND ft1.c1 < 100 AND ft5.c1 < 100 FOR UPDATE;
+SELECT * FROM ft1, ft4, ft5, local_tbl WHERE ft1.c1 = ft4.c1 AND ft1.c1 = ft5.c1
+    AND ft1.c2 = local_tbl.c1 AND ft1.c1 < 100 AND ft5.c1 < 100 FOR UPDATE;
 RESET enable_nestloop;
 RESET enable_hashjoin;
 
@@ -1455,6 +1477,23 @@ SELECT ft2.*, ft4.* FROM ft2 INNER JOIN
 	WHERE ft2.c1 > 900
 	ORDER BY ft2.c1 LIMIT 10;
 
+-- Semi-join conditions shouldn't pop up as left/right join clauses.
+SET enable_material TO off;
+EXPLAIN (verbose, costs off)
+SELECT x1.c1 FROM
+		(SELECT * FROM ft2 WHERE EXISTS (SELECT 1 FROM ft4 WHERE ft4.c1 = ft2.c1 AND ft2.c2 < 10)) x1
+	RIGHT JOIN
+		(SELECT * FROM ft2 WHERE EXISTS (SELECT 1 FROM ft4 WHERE ft4.c1 = ft2.c1 AND ft2.c2 < 10)) x2
+	ON (x1.c1 = x2.c1)
+ORDER BY x1.c1 LIMIT 10;
+SELECT x1.c1 FROM
+		(SELECT * FROM ft2 WHERE EXISTS (SELECT 1 FROM ft4 WHERE ft4.c1 = ft2.c1 AND ft2.c2 < 10)) x1
+	RIGHT JOIN
+		(SELECT * FROM ft2 WHERE EXISTS (SELECT 1 FROM ft4 WHERE ft4.c1 = ft2.c1 AND ft2.c2 < 10)) x2
+	ON (x1.c1 = x2.c1)
+ORDER BY x1.c1 LIMIT 10;
+RESET enable_material;
+
 -- Can't push down semi-join with inner rel vars in targetlist
 EXPLAIN (verbose, costs off)
 SELECT ft1.c1 FROM ft1 JOIN ft2 on ft1.c1 = ft2.c1 WHERE
@@ -1859,12 +1898,15 @@ select * from rem1;
 -- ===================================================================
 create table gloc1 (
   a int,
-  b int generated always as (a * 2) stored);
+  b int generated always as (a * 2) stored,
+  c int
+);
 alter table gloc1 set (autovacuum_enabled = 'false');
 create foreign table grem1 (
   a int,
-  b int generated always as (a * 2) stored)
-  server loopback options(table_name 'gloc1');
+  b int generated always as (a * 2) stored,
+  c int generated always as (a * 3) virtual
+) server loopback options(table_name 'gloc1');
 explain (verbose, costs off)
 insert into grem1 (a) values (1), (2);
 insert into grem1 (a) values (1), (2);
@@ -3407,9 +3449,14 @@ DROP SERVER loopback3 CASCADE;
 -- List all the existing cached connections. loopback and loopback3
 -- should be output as invalid connections. Also the server name and user name
 -- for loopback3 should be NULL because both server and user mapping were
--- dropped.
-SELECT server_name, user_name = CURRENT_USER as "user_name = CURRENT_USER", valid, used_in_xact, closed
-FROM postgres_fdw_get_connections() ORDER BY 1;
+-- dropped. In this test, the PIDs of remote backends can be gathered from
+-- pg_stat_activity, and remote_backend_pid should match one of those PIDs.
+SELECT server_name, user_name = CURRENT_USER as "user_name = CURRENT_USER",
+  valid, used_in_xact, closed,
+  remote_backend_pid = ANY(SELECT pid FROM pg_stat_activity
+  WHERE backend_type = 'client backend' AND pid <> pg_backend_pid())
+  as remote_backend_pid
+  FROM postgres_fdw_get_connections() ORDER BY 1;
 -- The invalid connections get closed in pgfdw_xact_callback during commit.
 COMMIT;
 -- All cached connections were closed while committing above xact, so no
@@ -4285,17 +4332,26 @@ SELECT 1 FROM ft1 LIMIT 1;
 
 -- Since the remote server is still connected, "closed" should be FALSE,
 -- or NULL if the connection status check is not available.
-SELECT CASE WHEN closed IS NOT true THEN 1 ELSE 0 END
+-- In this test, the remote backend handling this connection should have
+-- application_name set to "fdw_conn_check", so remote_backend_pid should
+-- match the PID from the pg_stat_activity entry with that application_name.
+SELECT server_name,
+  CASE WHEN closed IS NOT true THEN false ELSE true END AS closed,
+  remote_backend_pid = (SELECT pid FROM pg_stat_activity
+  WHERE application_name = 'fdw_conn_check') AS remote_backend_pid
   FROM postgres_fdw_get_connections(true);
 
 -- After terminating the remote backend, since the connection is closed,
 -- "closed" should be TRUE, or NULL if the connection status check
--- is not available.
+-- is not available. Despite the termination, remote_backend_pid should
+-- still show the non-zero PID of the terminated remote backend.
 DO $$ BEGIN
 PERFORM pg_terminate_backend(pid, 180000) FROM pg_stat_activity
   WHERE application_name = 'fdw_conn_check';
 END $$;
-SELECT CASE WHEN closed IS NOT false THEN 1 ELSE 0 END
+SELECT server_name,
+  CASE WHEN closed IS NOT false THEN true ELSE false END AS closed,
+  remote_backend_pid <> 0 AS remote_backend_pid
   FROM postgres_fdw_get_connections(true);
 
 -- Clean up

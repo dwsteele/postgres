@@ -33,10 +33,12 @@
 #include "common/blkreftable.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/walreceiver.h"
+#include "storage/aio_subsys.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -144,7 +146,7 @@ int			wal_summary_keep_time = 10 * HOURS_PER_DAY * MINS_PER_HOUR;
 
 static void WalSummarizerShutdown(int code, Datum arg);
 static XLogRecPtr GetLatestLSN(TimeLineID *tli);
-static void HandleWalSummarizerInterrupts(void);
+static void ProcessWalSummarizerInterrupts(void);
 static XLogRecPtr SummarizeWAL(TimeLineID tli, XLogRecPtr start_lsn,
 							   bool exact, XLogRecPtr switch_lsn,
 							   XLogRecPtr maximum_lsn);
@@ -208,7 +210,7 @@ WalSummarizerShmemInit(void)
  * Entry point for walsummarizer process.
  */
 void
-WalSummarizerMain(char *startup_data, size_t startup_data_len)
+WalSummarizerMain(const void *startup_data, size_t startup_data_len)
 {
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext context;
@@ -288,6 +290,7 @@ WalSummarizerMain(char *startup_data, size_t startup_data_len)
 		LWLockReleaseAll();
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
+		pgaio_error_cleanup();
 		ReleaseAuxProcessResources(false);
 		AtEOXact_Files(false);
 		AtEOXact_HashTables(false);
@@ -355,7 +358,7 @@ WalSummarizerMain(char *startup_data, size_t startup_data_len)
 		MemoryContextReset(context);
 
 		/* Process any signals received recently. */
-		HandleWalSummarizerInterrupts();
+		ProcessWalSummarizerInterrupts();
 
 		/* If it's time to remove any old WAL summaries, do that now. */
 		MaybeRemoveOldWalSummaries();
@@ -382,7 +385,7 @@ WalSummarizerMain(char *startup_data, size_t startup_data_len)
 
 			switch_lsn = tliSwitchPoint(current_tli, tles, &switch_tli);
 			ereport(DEBUG1,
-					errmsg_internal("switch point from TLI %u to TLI %u is at %X/%X",
+					errmsg_internal("switch point from TLI %u to TLI %u is at %X/%08X",
 									current_tli, switch_tli, LSN_FORMAT_ARGS(switch_lsn)));
 		}
 
@@ -738,7 +741,7 @@ WaitForWalSummarization(XLogRecPtr lsn)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("WAL summarization is not progressing"),
-						 errdetail("Summarization is needed through %X/%X, but is stuck at %X/%X on disk and %X/%X in memory.",
+						 errdetail("Summarization is needed through %X/%08X, but is stuck at %X/%08X on disk and %X/%08X in memory.",
 								   LSN_FORMAT_ARGS(lsn),
 								   LSN_FORMAT_ARGS(summarized_lsn),
 								   LSN_FORMAT_ARGS(pending_lsn))));
@@ -752,12 +755,12 @@ WaitForWalSummarization(XLogRecPtr lsn)
 												current_time) / 1000;
 			ereport(WARNING,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg_plural("still waiting for WAL summarization through %X/%X after %ld second",
-								   "still waiting for WAL summarization through %X/%X after %ld seconds",
+					 errmsg_plural("still waiting for WAL summarization through %X/%08X after %ld second",
+								   "still waiting for WAL summarization through %X/%08X after %ld seconds",
 								   elapsed_seconds,
 								   LSN_FORMAT_ARGS(lsn),
 								   elapsed_seconds),
-					 errdetail("Summarization has reached %X/%X on disk and %X/%X in memory.",
+					 errdetail("Summarization has reached %X/%08X on disk and %X/%08X in memory.",
 							   LSN_FORMAT_ARGS(summarized_lsn),
 							   LSN_FORMAT_ARGS(pending_lsn))));
 		}
@@ -855,7 +858,7 @@ GetLatestLSN(TimeLineID *tli)
  * Interrupt handler for main loop of WAL summarizer process.
  */
 static void
-HandleWalSummarizerInterrupts(void)
+ProcessWalSummarizerInterrupts(void)
 {
 	if (ProcSignalBarrierPending)
 		ProcessProcSignalBarrier();
@@ -978,7 +981,7 @@ SummarizeWAL(TimeLineID tli, XLogRecPtr start_lsn, bool exact,
 			if (private_data->end_of_wal)
 			{
 				ereport(DEBUG1,
-						errmsg_internal("could not read WAL from timeline %u at %X/%X: end of WAL at %X/%X",
+						errmsg_internal("could not read WAL from timeline %u at %X/%08X: end of WAL at %X/%08X",
 										tli,
 										LSN_FORMAT_ARGS(start_lsn),
 										LSN_FORMAT_ARGS(private_data->read_upto)));
@@ -997,8 +1000,8 @@ SummarizeWAL(TimeLineID tli, XLogRecPtr start_lsn, bool exact,
 			}
 			else
 				ereport(ERROR,
-						(errmsg("could not find a valid record after %X/%X",
-								LSN_FORMAT_ARGS(start_lsn))));
+						errmsg("could not find a valid record after %X/%08X",
+							   LSN_FORMAT_ARGS(start_lsn)));
 		}
 
 		/* We shouldn't go backward. */
@@ -1015,7 +1018,7 @@ SummarizeWAL(TimeLineID tli, XLogRecPtr start_lsn, bool exact,
 		XLogRecord *record;
 		uint8		rmid;
 
-		HandleWalSummarizerInterrupts();
+		ProcessWalSummarizerInterrupts();
 
 		/* We shouldn't go backward. */
 		Assert(summary_start_lsn <= xlogreader->EndRecPtr);
@@ -1031,7 +1034,7 @@ SummarizeWAL(TimeLineID tli, XLogRecPtr start_lsn, bool exact,
 				 * able to read a complete record.
 				 */
 				ereport(DEBUG1,
-						errmsg_internal("could not read WAL from timeline %u at %X/%X: end of WAL at %X/%X",
+						errmsg_internal("could not read WAL from timeline %u at %X/%08X: end of WAL at %X/%08X",
 										tli,
 										LSN_FORMAT_ARGS(xlogreader->EndRecPtr),
 										LSN_FORMAT_ARGS(private_data->read_upto)));
@@ -1042,13 +1045,13 @@ SummarizeWAL(TimeLineID tli, XLogRecPtr start_lsn, bool exact,
 			if (errormsg)
 				ereport(ERROR,
 						(errcode_for_file_access(),
-						 errmsg("could not read WAL from timeline %u at %X/%X: %s",
+						 errmsg("could not read WAL from timeline %u at %X/%08X: %s",
 								tli, LSN_FORMAT_ARGS(xlogreader->EndRecPtr),
 								errormsg)));
 			else
 				ereport(ERROR,
 						(errcode_for_file_access(),
-						 errmsg("could not read WAL from timeline %u at %X/%X",
+						 errmsg("could not read WAL from timeline %u at %X/%08X",
 								tli, LSN_FORMAT_ARGS(xlogreader->EndRecPtr))));
 		}
 
@@ -1219,7 +1222,7 @@ SummarizeWAL(TimeLineID tli, XLogRecPtr start_lsn, bool exact,
 
 		/* Tell the user what we did. */
 		ereport(DEBUG1,
-				errmsg_internal("summarized WAL on TLI %u from %X/%X to %X/%X",
+				errmsg_internal("summarized WAL on TLI %u from %X/%08X to %X/%08X",
 								tli,
 								LSN_FORMAT_ARGS(summary_start_lsn),
 								LSN_FORMAT_ARGS(summary_end_lsn)));
@@ -1231,7 +1234,7 @@ SummarizeWAL(TimeLineID tli, XLogRecPtr start_lsn, bool exact,
 	/* If we skipped a non-zero amount of WAL, log a debug message. */
 	if (summary_end_lsn > summary_start_lsn && fast_forward)
 		ereport(DEBUG1,
-				errmsg_internal("skipped summarizing WAL on TLI %u from %X/%X to %X/%X",
+				errmsg_internal("skipped summarizing WAL on TLI %u from %X/%08X to %X/%08X",
 								tli,
 								LSN_FORMAT_ARGS(summary_start_lsn),
 								LSN_FORMAT_ARGS(summary_end_lsn)));
@@ -1502,7 +1505,7 @@ summarizer_read_local_xlog_page(XLogReaderState *state,
 	WALReadError errinfo;
 	SummarizerReadLocalXLogPrivate *private_data;
 
-	HandleWalSummarizerInterrupts();
+	ProcessWalSummarizerInterrupts();
 
 	private_data = (SummarizerReadLocalXLogPrivate *)
 		state->private_data;
@@ -1540,7 +1543,7 @@ summarizer_read_local_xlog_page(XLogReaderState *state,
 				 * current timeline, so more data might show up.  Delay here
 				 * so we don't tight-loop.
 				 */
-				HandleWalSummarizerInterrupts();
+				ProcessWalSummarizerInterrupts();
 				summarizer_wait_for_wal();
 
 				/* Recheck end-of-WAL. */
@@ -1577,7 +1580,7 @@ summarizer_read_local_xlog_page(XLogReaderState *state,
 
 					/* Debugging output. */
 					ereport(DEBUG1,
-							errmsg_internal("timeline %u became historic, can read up to %X/%X",
+							errmsg_internal("timeline %u became historic, can read up to %X/%08X",
 											private_data->tli, LSN_FORMAT_ARGS(private_data->read_upto)));
 				}
 
@@ -1636,6 +1639,9 @@ summarizer_wait_for_wal(void)
 			sleep_quanta -= pages_read_since_last_sleep;
 	}
 
+	/* Report pending statistics to the cumulative stats system. */
+	pgstat_report_wal(false);
+
 	/* OK, now sleep. */
 	(void) WaitLatch(MyLatch,
 					 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -1688,7 +1694,7 @@ MaybeRemoveOldWalSummaries(void)
 		XLogRecPtr	oldest_lsn = InvalidXLogRecPtr;
 		TimeLineID	selected_tli;
 
-		HandleWalSummarizerInterrupts();
+		ProcessWalSummarizerInterrupts();
 
 		/*
 		 * Pick a timeline for which some summary files still exist on disk,
@@ -1707,7 +1713,7 @@ MaybeRemoveOldWalSummaries(void)
 		{
 			WalSummaryFile *ws = lfirst(lc);
 
-			HandleWalSummarizerInterrupts();
+			ProcessWalSummarizerInterrupts();
 
 			/* If it's not on this timeline, it's not time to consider it. */
 			if (selected_tli != ws->tli)

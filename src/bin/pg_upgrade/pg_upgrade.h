@@ -125,6 +125,11 @@ extern char *output_files[];
  */
 #define JSONB_FORMAT_CHANGE_CAT_VER 201409291
 
+/*
+ * The control file was changed to have the default char signedness,
+ * commit 44fe30fdab6746a287163e7cc093fd36cda8eb92
+ */
+#define DEFAULT_CHAR_SIGNEDNESS_CAT_VER 202502212
 
 /*
  * Each relation is represented by a relinfo structure.
@@ -245,6 +250,7 @@ typedef struct
 	bool		date_is_int;
 	bool		float8_pass_by_value;
 	uint32		data_checksum_version;
+	bool		default_char_signedness;
 } ControlData;
 
 /*
@@ -256,6 +262,7 @@ typedef enum
 	TRANSFER_MODE_COPY,
 	TRANSFER_MODE_COPY_FILE_RANGE,
 	TRANSFER_MODE_LINK,
+	TRANSFER_MODE_SWAP,
 } transferMode;
 
 /*
@@ -293,8 +300,12 @@ typedef struct
 	uint32		major_version;	/* PG_VERSION of cluster */
 	char		major_version_str[64];	/* string PG_VERSION of cluster */
 	uint32		bin_version;	/* version returned from pg_ctl */
+	char	  **tablespaces;	/* tablespace directories */
+	int			num_tablespaces;
 	const char *tablespace_suffix;	/* directory specification */
 	int			nsubs;			/* number of subscriptions */
+	bool		sub_retain_dead_tuples; /* whether a subscription enables
+										 * retain_dead_tuples. */
 } ClusterInfo;
 
 
@@ -327,6 +338,10 @@ typedef struct
 	int			jobs;			/* number of processes/threads to use */
 	char	   *socketdir;		/* directory to use for Unix sockets */
 	char	   *sync_method;
+	bool		do_statistics;	/* carry over statistics from old cluster */
+	int			char_signedness;	/* default char signedness: -1 for initial
+									 * value, 1 for "signed" and 0 for
+									 * "unsigned" */
 } UserOpts;
 
 typedef struct
@@ -343,8 +358,6 @@ typedef struct
 	const char *progname;		/* complete pathname for this program */
 	char	   *user;			/* username for clusters */
 	bool		user_specified; /* user specified on command-line */
-	char	  **old_tablespaces;	/* tablespaces */
-	int			num_old_tablespaces;
 	LibraryInfo *libraries;		/* loadable libraries */
 	int			num_libraries;
 	ClusterInfo *running_cluster;
@@ -381,7 +394,7 @@ void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
 
 void		get_control_data(ClusterInfo *cluster);
 void		check_control_data(ControlData *oldctrl, ControlData *newctrl);
-void		disable_old_cluster(void);
+void		disable_old_cluster(transferMode transfer_mode);
 
 
 /* dump.c */
@@ -413,7 +426,7 @@ void		rewriteVisibilityMap(const char *fromfile, const char *tofile,
 								 const char *schemaName, const char *relName);
 void		check_file_clone(void);
 void		check_copy_file_range(void);
-void		check_hard_link(void);
+void		check_hard_link(transferMode transfer_mode);
 
 /* fopen_priv() is no longer different from fopen() */
 #define fopen_priv(path, mode)	fopen(path, mode)
@@ -430,7 +443,7 @@ FileNameMap *gen_db_file_maps(DbInfo *old_db,
 							  const char *new_pgdata);
 void		get_db_rel_and_slot_infos(ClusterInfo *cluster);
 int			count_old_cluster_logical_slots(void);
-void		get_subscription_count(ClusterInfo *cluster);
+void		get_subscription_info(ClusterInfo *cluster);
 
 /* option.c */
 
@@ -444,7 +457,7 @@ void		transfer_all_new_tablespaces(DbInfoArr *old_db_arr,
 										 DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata);
 void		transfer_all_new_dbs(DbInfoArr *old_db_arr,
 								 DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata,
-								 char *old_tablespace);
+								 char *old_tablespace, char *new_tablespace);
 
 /* tablespace.c */
 
@@ -471,7 +484,7 @@ int			get_user_info(char **user_name_p);
 void		check_ok(void);
 void		report_status(eLogType type, const char *fmt,...) pg_attribute_printf(2, 3);
 void		pg_log(eLogType type, const char *fmt,...) pg_attribute_printf(2, 3);
-void		pg_fatal(const char *fmt,...) pg_attribute_printf(1, 2) pg_attribute_noreturn();
+pg_noreturn void pg_fatal(const char *fmt,...) pg_attribute_printf(1, 2);
 void		end_progress_output(void);
 void		cleanup_output_dirs(void);
 void		prep_status(const char *fmt,...) pg_attribute_printf(1, 2);
@@ -492,7 +505,7 @@ void		parallel_exec_prog(const char *log_file, const char *opt_log_file,
 							   const char *fmt,...) pg_attribute_printf(3, 4);
 void		parallel_transfer_all_new_dbs(DbInfoArr *old_db_arr, DbInfoArr *new_db_arr,
 										  char *old_pgdata, char *new_pgdata,
-										  char *old_tablespace);
+										  char *old_tablespace, char *new_tablespace);
 bool		reap_child(bool wait_for_child);
 
 /* task.c */
