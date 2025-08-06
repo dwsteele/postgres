@@ -46,6 +46,14 @@ SELECT EXISTS (
 EOM
 ok($result, "WAL summarization caught up after insert");
 
+# The WAL summarizer should have generated some IO statistics.
+$node1->poll_query_until(
+	'postgres',
+	q{SELECT sum(reads) > 0 FROM pg_stat_io
+   WHERE backend_type = 'walsummarizer' AND object = 'wal'})
+  or die
+  "Timed out while waiting for WAL summarizer to generate statistics for WAL reads";
+
 # Find the highest LSN that is summarized on disk.
 my $summarized_lsn = $node1->safe_psql('postgres', <<EOM);
 SELECT MAX(end_lsn) AS summarized_lsn FROM pg_available_wal_summaries()

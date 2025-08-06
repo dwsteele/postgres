@@ -38,6 +38,7 @@
 #include "parser/parse_clause.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_relation.h"
+#include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -404,6 +405,14 @@ pub_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
 			relation->rd_att->constr->has_generated_stored)
 			*invalid_gen_col = true;
 
+		/*
+		 * Virtual generated columns are currently not supported for logical
+		 * replication at all.
+		 */
+		if (relation->rd_att->constr &&
+			relation->rd_att->constr->has_generated_virtual)
+			*invalid_gen_col = true;
+
 		if (*invalid_gen_col && *invalid_column_list)
 			return true;
 	}
@@ -430,7 +439,17 @@ pub_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
 			 * The publish_generated_columns option must be set to stored if
 			 * the REPLICA IDENTITY contains any stored generated column.
 			 */
-			if (pubgencols_type != PUBLISH_GENCOLS_STORED && att->attgenerated)
+			if (att->attgenerated == ATTRIBUTE_GENERATED_STORED && pubgencols_type != PUBLISH_GENCOLS_STORED)
+			{
+				*invalid_gen_col = true;
+				break;
+			}
+
+			/*
+			 * The equivalent setting for virtual generated columns does not
+			 * exist yet.
+			 */
+			if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 			{
 				*invalid_gen_col = true;
 				break;
@@ -470,6 +489,45 @@ pub_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
 	bms_free(idattrs);
 
 	return *invalid_column_list || *invalid_gen_col;
+}
+
+/*
+ * Invalidate entries in the RelationSyncCache for relations included in the
+ * specified publication, either via FOR TABLE or FOR TABLES IN SCHEMA.
+ *
+ * If 'puballtables' is true, invalidate all cache entries.
+ */
+void
+InvalidatePubRelSyncCache(Oid pubid, bool puballtables)
+{
+	if (puballtables)
+	{
+		CacheInvalidateRelSyncAll();
+	}
+	else
+	{
+		List	   *relids = NIL;
+		List	   *schemarelids = NIL;
+
+		/*
+		 * For partitioned tables, we must invalidate all partitions and
+		 * itself. WAL records for INSERT/UPDATE/DELETE specify leaf tables as
+		 * a target. However, WAL records for TRUNCATE specify both a root and
+		 * its leaves.
+		 */
+		relids = GetPublicationRelations(pubid,
+										 PUBLICATION_PART_ALL);
+		schemarelids = GetAllSchemaPublicationRelations(pubid,
+														PUBLICATION_PART_ALL);
+
+		relids = list_concat_unique_oid(relids, schemarelids);
+
+		/* Invalidate the relsyncache */
+		foreach_oid(relid, relids)
+			CacheInvalidateRelSync(relid);
+	}
+
+	return;
 }
 
 /* check_functions_in_node callback */
@@ -689,6 +747,8 @@ TransformPubWhereClauses(List *tables, const char *queryString,
 		/* Fix up collation information */
 		assign_expr_collations(pstate, whereclause);
 
+		whereclause = expand_generated_columns_in_expr(whereclause, pri->relation, 1);
+
 		/*
 		 * We allow only simple expressions in row filters. See
 		 * check_simple_rowfilter_expr_walker.
@@ -836,7 +896,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 		BoolGetDatum(pubactions.pubtruncate);
 	values[Anum_pg_publication_pubviaroot - 1] =
 		BoolGetDatum(publish_via_partition_root);
-	values[Anum_pg_publication_pubgencols_type - 1] =
+	values[Anum_pg_publication_pubgencols - 1] =
 		CharGetDatum(publish_generated_columns);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
@@ -1048,8 +1108,8 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 
 	if (publish_generated_columns_given)
 	{
-		values[Anum_pg_publication_pubgencols_type - 1] = CharGetDatum(publish_generated_columns);
-		replaces[Anum_pg_publication_pubgencols_type - 1] = true;
+		values[Anum_pg_publication_pubgencols - 1] = CharGetDatum(publish_generated_columns);
+		replaces[Anum_pg_publication_pubgencols - 1] = true;
 	}
 
 	tup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
@@ -1992,7 +2052,7 @@ AlterPublicationOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 ObjectAddress
 AlterPublicationOwner(const char *name, Oid newOwnerId)
 {
-	Oid			subid;
+	Oid			pubid;
 	HeapTuple	tup;
 	Relation	rel;
 	ObjectAddress address;
@@ -2008,11 +2068,11 @@ AlterPublicationOwner(const char *name, Oid newOwnerId)
 				 errmsg("publication \"%s\" does not exist", name)));
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
-	subid = pubform->oid;
+	pubid = pubform->oid;
 
 	AlterPublicationOwner_internal(rel, tup, newOwnerId);
 
-	ObjectAddressSet(address, PublicationRelationId, subid);
+	ObjectAddressSet(address, PublicationRelationId, pubid);
 
 	heap_freetuple(tup);
 
@@ -2025,19 +2085,19 @@ AlterPublicationOwner(const char *name, Oid newOwnerId)
  * Change publication owner -- by OID
  */
 void
-AlterPublicationOwner_oid(Oid subid, Oid newOwnerId)
+AlterPublicationOwner_oid(Oid pubid, Oid newOwnerId)
 {
 	HeapTuple	tup;
 	Relation	rel;
 
 	rel = table_open(PublicationRelationId, RowExclusiveLock);
 
-	tup = SearchSysCacheCopy1(PUBLICATIONOID, ObjectIdGetDatum(subid));
+	tup = SearchSysCacheCopy1(PUBLICATIONOID, ObjectIdGetDatum(pubid));
 
 	if (!HeapTupleIsValid(tup))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("publication with OID %u does not exist", subid)));
+				 errmsg("publication with OID %u does not exist", pubid)));
 
 	AlterPublicationOwner_internal(rel, tup, newOwnerId);
 
@@ -2053,25 +2113,25 @@ AlterPublicationOwner_oid(Oid subid, Oid newOwnerId)
 static char
 defGetGeneratedColsOption(DefElem *def)
 {
-	char	   *sval;
+	char	   *sval = "";
 
 	/*
-	 * If no parameter value given, assume "stored" is meant.
+	 * A parameter value is required.
 	 */
-	if (!def->arg)
-		return PUBLISH_GENCOLS_STORED;
+	if (def->arg)
+	{
+		sval = defGetString(def);
 
-	sval = defGetString(def);
-
-	if (pg_strcasecmp(sval, "none") == 0)
-		return PUBLISH_GENCOLS_NONE;
-	if (pg_strcasecmp(sval, "stored") == 0)
-		return PUBLISH_GENCOLS_STORED;
+		if (pg_strcasecmp(sval, "none") == 0)
+			return PUBLISH_GENCOLS_NONE;
+		if (pg_strcasecmp(sval, "stored") == 0)
+			return PUBLISH_GENCOLS_STORED;
+	}
 
 	ereport(ERROR,
 			errcode(ERRCODE_SYNTAX_ERROR),
-			errmsg("%s requires a \"none\" or \"stored\" value",
-				   def->defname));
+			errmsg("invalid value for publication parameter \"%s\": \"%s\"", def->defname, sval),
+			errdetail("Valid values are \"%s\" and \"%s\".", "none", "stored"));
 
 	return PUBLISH_GENCOLS_NONE;	/* keep compiler quiet */
 }

@@ -43,6 +43,7 @@
 #include "parser/parse_relation.h"
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
+#include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
@@ -79,6 +80,7 @@ static bool GetTupleForTrigger(EState *estate,
 							   ItemPointer tid,
 							   LockTupleMode lockmode,
 							   TupleTableSlot *oldslot,
+							   bool do_epq_recheck,
 							   TupleTableSlot **epqslot,
 							   TM_Result *tmresultp,
 							   TM_FailureData *tmfdp);
@@ -101,6 +103,7 @@ static void AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 								  bool is_crosspart_update);
 static void AfterTriggerEnlargeQueryState(void);
 static bool before_stmt_triggers_fired(Oid relid, CmdType cmdType);
+static HeapTuple check_modified_virtual_generated(TupleDesc tupdesc, HeapTuple tuple);
 
 
 /*
@@ -641,7 +644,8 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 					if (TRIGGER_FOR_BEFORE(tgtype) &&
 						var->varattno == 0 &&
 						RelationGetDescr(rel)->constr &&
-						RelationGetDescr(rel)->constr->has_generated_stored)
+						(RelationGetDescr(rel)->constr->has_generated_stored ||
+						 RelationGetDescr(rel)->constr->has_generated_virtual))
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 								 errmsg("BEFORE trigger's WHEN condition cannot reference NEW generated columns"),
@@ -2504,6 +2508,8 @@ ExecBRInsertTriggers(EState *estate, ResultRelInfo *relinfo,
 		}
 		else if (newtuple != oldtuple)
 		{
+			newtuple = check_modified_virtual_generated(RelationGetDescr(relinfo->ri_RelationDesc), newtuple);
+
 			ExecForceStoreHeapTuple(newtuple, slot, false);
 
 			/*
@@ -2688,7 +2694,8 @@ ExecBRDeleteTriggers(EState *estate, EPQState *epqstate,
 					 HeapTuple fdw_trigtuple,
 					 TupleTableSlot **epqslot,
 					 TM_Result *tmresult,
-					 TM_FailureData *tmfd)
+					 TM_FailureData *tmfd,
+					 bool is_merge_delete)
 {
 	TupleTableSlot *slot = ExecGetTriggerOldSlot(estate, relinfo);
 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
@@ -2703,9 +2710,17 @@ ExecBRDeleteTriggers(EState *estate, EPQState *epqstate,
 	{
 		TupleTableSlot *epqslot_candidate = NULL;
 
+		/*
+		 * Get a copy of the on-disk tuple we are planning to delete.  In
+		 * general, if the tuple has been concurrently updated, we should
+		 * recheck it using EPQ.  However, if this is a MERGE DELETE action,
+		 * we skip this EPQ recheck and leave it to the caller (it must do
+		 * additional rechecking, and might end up executing a different
+		 * action entirely).
+		 */
 		if (!GetTupleForTrigger(estate, epqstate, relinfo, tupleid,
-								LockTupleExclusive, slot, &epqslot_candidate,
-								tmresult, tmfd))
+								LockTupleExclusive, slot, !is_merge_delete,
+								&epqslot_candidate, tmresult, tmfd))
 			return false;
 
 		/*
@@ -2795,6 +2810,7 @@ ExecARDeleteTriggers(EState *estate,
 							   tupleid,
 							   LockTupleExclusive,
 							   slot,
+							   false,
 							   NULL,
 							   NULL,
 							   NULL);
@@ -2939,7 +2955,8 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 					 HeapTuple fdw_trigtuple,
 					 TupleTableSlot *newslot,
 					 TM_Result *tmresult,
-					 TM_FailureData *tmfd)
+					 TM_FailureData *tmfd,
+					 bool is_merge_update)
 {
 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
 	TupleTableSlot *oldslot = ExecGetTriggerOldSlot(estate, relinfo);
@@ -2960,10 +2977,17 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 	{
 		TupleTableSlot *epqslot_candidate = NULL;
 
-		/* get a copy of the on-disk tuple we are planning to update */
+		/*
+		 * Get a copy of the on-disk tuple we are planning to update.  In
+		 * general, if the tuple has been concurrently updated, we should
+		 * recheck it using EPQ.  However, if this is a MERGE UPDATE action,
+		 * we skip this EPQ recheck and leave it to the caller (it must do
+		 * additional rechecking, and might end up executing a different
+		 * action entirely).
+		 */
 		if (!GetTupleForTrigger(estate, epqstate, relinfo, tupleid,
-								lockmode, oldslot, &epqslot_candidate,
-								tmresult, tmfd))
+								lockmode, oldslot, !is_merge_update,
+								&epqslot_candidate, tmresult, tmfd))
 			return false;		/* cancel the update action */
 
 		/*
@@ -3061,6 +3085,8 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 		}
 		else if (newtuple != oldtuple)
 		{
+			newtuple = check_modified_virtual_generated(RelationGetDescr(relinfo->ri_RelationDesc), newtuple);
+
 			ExecForceStoreHeapTuple(newtuple, newslot, false);
 
 			/*
@@ -3135,6 +3161,7 @@ ExecARUpdateTriggers(EState *estate, ResultRelInfo *relinfo,
 							   tupleid,
 							   LockTupleExclusive,
 							   oldslot,
+							   false,
 							   NULL,
 							   NULL,
 							   NULL);
@@ -3291,6 +3318,7 @@ GetTupleForTrigger(EState *estate,
 				   ItemPointer tid,
 				   LockTupleMode lockmode,
 				   TupleTableSlot *oldslot,
+				   bool do_epq_recheck,
 				   TupleTableSlot **epqslot,
 				   TM_Result *tmresultp,
 				   TM_FailureData *tmfdp)
@@ -3350,29 +3378,30 @@ GetTupleForTrigger(EState *estate,
 				if (tmfd.traversed)
 				{
 					/*
-					 * Recheck the tuple using EPQ. For MERGE, we leave this
-					 * to the caller (it must do additional rechecking, and
-					 * might end up executing a different action entirely).
+					 * Recheck the tuple using EPQ, if requested.  Otherwise,
+					 * just return that it was concurrently updated.
 					 */
-					if (estate->es_plannedstmt->commandType == CMD_MERGE)
+					if (do_epq_recheck)
+					{
+						*epqslot = EvalPlanQual(epqstate,
+												relation,
+												relinfo->ri_RangeTableIndex,
+												oldslot);
+
+						/*
+						 * If PlanQual failed for updated tuple - we must not
+						 * process this tuple!
+						 */
+						if (TupIsNull(*epqslot))
+						{
+							*epqslot = NULL;
+							return false;
+						}
+					}
+					else
 					{
 						if (tmresultp)
 							*tmresultp = TM_Updated;
-						return false;
-					}
-
-					*epqslot = EvalPlanQual(epqstate,
-											relation,
-											relinfo->ri_RangeTableIndex,
-											oldslot);
-
-					/*
-					 * If PlanQual failed for updated tuple - we must not
-					 * process this tuple!
-					 */
-					if (TupIsNull(*epqslot))
-					{
-						*epqslot = NULL;
 						return false;
 					}
 				}
@@ -3491,6 +3520,8 @@ TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 
 			oldContext = MemoryContextSwitchTo(estate->es_query_cxt);
 			tgqual = stringToNode(trigger->tgqual);
+			tgqual = expand_generated_columns_in_expr(tgqual, relinfo->ri_RelationDesc, PRS2_OLD_VARNO);
+			tgqual = expand_generated_columns_in_expr(tgqual, relinfo->ri_RelationDesc, PRS2_NEW_VARNO);
 			/* Change references to OLD and NEW to INNER_VAR and OUTER_VAR */
 			ChangeVarNodes(tgqual, PRS2_OLD_VARNO, INNER_VAR, 0);
 			ChangeVarNodes(tgqual, PRS2_NEW_VARNO, OUTER_VAR, 0);
@@ -4991,10 +5022,10 @@ MakeTransitionCaptureState(TriggerDesc *trigdesc, Oid relid, CmdType cmdType)
 
 	/* Now build the TransitionCaptureState struct, in caller's context */
 	state = (TransitionCaptureState *) palloc0(sizeof(TransitionCaptureState));
-	state->tcs_delete_old_table = trigdesc->trig_delete_old_table;
-	state->tcs_update_old_table = trigdesc->trig_update_old_table;
-	state->tcs_update_new_table = trigdesc->trig_update_new_table;
-	state->tcs_insert_new_table = trigdesc->trig_insert_new_table;
+	state->tcs_delete_old_table = need_old_del;
+	state->tcs_update_old_table = need_old_upd;
+	state->tcs_update_new_table = need_new_upd;
+	state->tcs_insert_new_table = need_new_ins;
 	state->tcs_private = table;
 
 	return state;
@@ -6620,4 +6651,38 @@ Datum
 pg_trigger_depth(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(MyTriggerDepth);
+}
+
+/*
+ * Check whether a trigger modified a virtual generated column and replace the
+ * value with null if so.
+ *
+ * We need to check this so that we don't end up storing a non-null value in a
+ * virtual generated column.
+ *
+ * We don't need to check for stored generated columns, since those will be
+ * overwritten later anyway.
+ */
+static HeapTuple
+check_modified_virtual_generated(TupleDesc tupdesc, HeapTuple tuple)
+{
+	if (!(tupdesc->constr && tupdesc->constr->has_generated_virtual))
+		return tuple;
+
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		if (TupleDescAttr(tupdesc, i)->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+		{
+			if (!heap_attisnull(tuple, i + 1, tupdesc))
+			{
+				int			replCol = i + 1;
+				Datum		replValue = 0;
+				bool		replIsnull = true;
+
+				tuple = heap_modify_tuple_by_cols(tuple, tupdesc, 1, &replCol, &replValue, &replIsnull);
+			}
+		}
+	}
+
+	return tuple;
 }

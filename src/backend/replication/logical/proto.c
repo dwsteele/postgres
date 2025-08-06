@@ -164,7 +164,7 @@ logicalrep_write_prepare_common(StringInfo out, LogicalRepMsgType type,
 	 * which case we expect to have a valid GID.
 	 */
 	Assert(txn->gid != NULL);
-	Assert(rbtxn_prepared(txn));
+	Assert(rbtxn_is_prepared(txn));
 	Assert(TransactionIdIsValid(txn->xid));
 
 	/* send the flags field */
@@ -809,7 +809,7 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 			continue;
 		}
 
-		if (att->attlen == -1 && VARATT_IS_EXTERNAL_ONDISK(values[i]))
+		if (att->attlen == -1 && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(values[i])))
 		{
 			/*
 			 * Unchanged toasted datum.  (Note that we don't promise to detect

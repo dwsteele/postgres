@@ -40,7 +40,7 @@
 #define GIST_FETCH_PROC					9
 #define GIST_OPTIONS_PROC				10
 #define GIST_SORTSUPPORT_PROC			11
-#define GIST_STRATNUM_PROC				12
+#define GIST_TRANSLATE_CMPTYPE_PROC		12
 #define GISTNProcs					12
 
 /*
@@ -248,6 +248,6 @@ typedef struct
 	do { (e).key = (k); (e).rel = (r); (e).page = (pg); \
 		 (e).offset = (o); (e).leafkey = (l); } while (0)
 
-extern StrategyNumber GistTranslateStratnum(Oid opclass, CompareType cmp);
+extern StrategyNumber gisttranslatecmptype(CompareType cmptype, Oid opfamily);
 
 #endif							/* GIST_H */

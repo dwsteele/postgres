@@ -8,6 +8,7 @@ injection_points_sources = files(
   'injection_points.c',
   'injection_stats.c',
   'injection_stats_fixed.c',
+  'regress_injection.c',
 )
 
 if host_system == 'windows'
@@ -34,9 +35,11 @@ tests += {
   'regress': {
     'sql': [
       'injection_points',
+      'hashagg',
       'reindex_conc',
+      'vacuum',
     ],
-    'regress_args': ['--dlpath', meson.build_root() / 'src/test/regress'],
+    'regress_args': ['--dlpath', meson.project_build_root() / 'src/test/regress'],
     # The injection points are cluster-wide, so disable installcheck
     'runningcheck': false,
   },
@@ -44,7 +47,9 @@ tests += {
     'specs': [
       'basic',
       'inplace',
+      'syscache-update-pruned',
     ],
+    'runningcheck': false, # see syscache-update-pruned
   },
   'tap': {
     'env': {

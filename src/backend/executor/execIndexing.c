@@ -181,6 +181,9 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 	if (len == 0)
 		return;
 
+	/* This Assert will fail if ExecOpenIndices is called twice */
+	Assert(resultRelInfo->ri_IndexRelationDescs == NULL);
+
 	/*
 	 * allocate space for result arrays
 	 */
@@ -211,9 +214,8 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 		ii = BuildIndexInfo(indexDesc);
 
 		/*
-		 * If the indexes are to be used for speculative insertion or conflict
-		 * detection in logical replication, add extra information required by
-		 * unique index entries.
+		 * If the indexes are to be used for speculative insertion, add extra
+		 * information required by unique index entries.
 		 */
 		if (speculative && ii->ii_Unique && !indexDesc->rd_index->indisexclusion)
 			BuildSpeculativeIndexInfo(indexDesc, ii);
@@ -246,19 +248,23 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 
 	for (i = 0; i < numIndices; i++)
 	{
-		if (indexDescs[i] == NULL)
-			continue;			/* shouldn't happen? */
+		/* This Assert will fail if ExecCloseIndices is called twice */
+		Assert(indexDescs[i] != NULL);
 
 		/* Give the index a chance to do some post-insert cleanup */
 		index_insert_cleanup(indexDescs[i], indexInfos[i]);
 
 		/* Drop lock acquired by ExecOpenIndices */
 		index_close(indexDescs[i], RowExclusiveLock);
+
+		/* Mark the index as closed */
+		indexDescs[i] = NULL;
 	}
 
 	/*
-	 * XXX should free indexInfo array here too?  Currently we assume that
-	 * such stuff will be cleaned up automatically in FreeExecutorState.
+	 * We don't attempt to free the IndexInfo data structures or the arrays,
+	 * instead assuming that such stuff will be cleaned up automatically in
+	 * FreeExecutorState.
 	 */
 }
 
@@ -273,7 +279,7 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		executor is performing an UPDATE that could not use an
  *		optimization like heapam's HOT (in more general terms a
  *		call to table_tuple_update() took place and set
- *		'update_indexes' to TUUI_All).  Receiving this hint makes
+ *		'update_indexes' to TU_All).  Receiving this hint makes
  *		us consider if we should pass down the 'indexUnchanged'
  *		hint in turn.  That's something that we figure out for
  *		each index_insert() call iff 'update' is true.
@@ -284,7 +290,7 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		HOT has been applied and any updated columns are indexed
  *		only by summarizing indexes (or in more general terms a
  *		call to table_tuple_update() took place and set
- *		'update_indexes' to TUUI_Summarizing). We can (and must)
+ *		'update_indexes' to TU_Summarizing). We can (and must)
  *		therefore only update the indexes that have
  *		'amsummarizing' = true.
  *
@@ -809,7 +815,7 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 retry:
 	conflict = false;
 	found_self = false;
-	index_scan = index_beginscan(heap, index, &DirtySnapshot, indnkeyatts, 0);
+	index_scan = index_beginscan(heap, index, &DirtySnapshot, NULL, indnkeyatts, 0);
 	index_rescan(index_scan, scankeys, indnkeyatts, NULL, 0);
 
 	while (index_getnext_slot(index_scan, ForwardScanDirection, existing_slot))

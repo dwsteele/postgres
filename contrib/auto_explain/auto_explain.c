@@ -16,11 +16,16 @@
 
 #include "access/parallel.h"
 #include "commands/explain.h"
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
 #include "common/pg_prng.h"
 #include "executor/instrument.h"
 #include "utils/guc.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "auto_explain",
+					.version = PG_VERSION
+);
 
 /* GUC variables */
 static int	auto_explain_log_min_duration = -1; /* msec or -1 */
@@ -93,7 +98,7 @@ _PG_init(void)
 	/* Define custom GUC variables. */
 	DefineCustomIntVariable("auto_explain.log_min_duration",
 							"Sets the minimum execution time above which plans will be logged.",
-							"Zero prints all plans. -1 turns this feature off.",
+							"-1 disables logging plans. 0 means log all plans.",
 							&auto_explain_log_min_duration,
 							-1,
 							-1, INT_MAX,
@@ -104,8 +109,8 @@ _PG_init(void)
 							NULL);
 
 	DefineCustomIntVariable("auto_explain.log_parameter_max_length",
-							"Sets the maximum length of query parameters to log.",
-							"Zero logs no query parameters, -1 logs them in full.",
+							"Sets the maximum length of query parameter values to log.",
+							"-1 means log values in full.",
 							&auto_explain_log_parameter_max_length,
 							-1,
 							-1, INT_MAX,

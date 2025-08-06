@@ -59,7 +59,7 @@ CATALOG(pg_publication,6104,PublicationRelationId)
 	 * 'n'(none) if generated column data should not be published. 's'(stored)
 	 * if stored generated column data should be published.
 	 */
-	char		pubgencols_type;
+	char		pubgencols;
 } FormData_pg_publication;
 
 /* ----------------
@@ -146,7 +146,7 @@ extern Publication *GetPublicationByName(const char *pubname, bool missing_ok);
 extern List *GetRelationPublications(Oid relid);
 
 /*---------
- * Expected values for pub_partopt parameter of GetRelationPublications(),
+ * Expected values for pub_partopt parameter of GetPublicationRelations(),
  * which allows callers to specify which partitions of partitioned tables
  * mentioned in the publication they expect to see.
  *

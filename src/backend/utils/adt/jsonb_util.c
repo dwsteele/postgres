@@ -48,8 +48,8 @@ static void convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *va
 static void convertJsonbScalar(StringInfo buffer, JEntry *header, JsonbValue *scalarVal);
 
 static int	reserveFromBuffer(StringInfo buffer, int len);
-static void appendToBuffer(StringInfo buffer, const char *data, int len);
-static void copyToBuffer(StringInfo buffer, int offset, const char *data, int len);
+static void appendToBuffer(StringInfo buffer, const void *data, int len);
+static void copyToBuffer(StringInfo buffer, int offset, const void *data, int len);
 static short padBufferToInt(StringInfo buffer);
 
 static JsonbIterator *iteratorFromContainer(JsonbContainer *container, JsonbIterator *parent);
@@ -277,22 +277,16 @@ compareJsonbContainers(JsonbContainer *a, JsonbContainer *b)
 		else
 		{
 			/*
-			 * It's safe to assume that the types differed, and that the va
-			 * and vb values passed were set.
-			 *
-			 * If the two values were of the same container type, then there'd
-			 * have been a chance to observe the variation in the number of
-			 * elements/pairs (when processing WJB_BEGIN_OBJECT, say). They're
-			 * either two heterogeneously-typed containers, or a container and
-			 * some scalar type.
-			 *
-			 * We don't have to consider the WJB_END_ARRAY and WJB_END_OBJECT
-			 * cases here, because we would have seen the corresponding
-			 * WJB_BEGIN_ARRAY and WJB_BEGIN_OBJECT tokens first, and
-			 * concluded that they don't match.
+			 * It's not possible for one iterator to report end of array or
+			 * object while the other one reports something else, because we
+			 * would have detected a length mismatch when we processed the
+			 * container-start tokens above.  Likewise we can't see WJB_DONE
+			 * from one but not the other.  So we have two different-type
+			 * containers, or a container and some scalar type, or two
+			 * different scalar types.  Sort on the basis of the type code.
 			 */
-			Assert(ra != WJB_END_ARRAY && ra != WJB_END_OBJECT);
-			Assert(rb != WJB_END_ARRAY && rb != WJB_END_OBJECT);
+			Assert(ra != WJB_DONE && ra != WJB_END_ARRAY && ra != WJB_END_OBJECT);
+			Assert(rb != WJB_DONE && rb != WJB_END_ARRAY && rb != WJB_END_OBJECT);
 
 			Assert(va.type != vb.type);
 			Assert(va.type != jbvBinary);
@@ -852,15 +846,20 @@ JsonbIteratorInit(JsonbContainer *container)
  * It is our job to expand the jbvBinary representation without bothering them
  * with it.  However, clients should not take it upon themselves to touch array
  * or Object element/pair buffers, since their element/pair pointers are
- * garbage.  Also, *val will not be set when returning WJB_END_ARRAY or
- * WJB_END_OBJECT, on the assumption that it's only useful to access values
- * when recursing in.
+ * garbage.
+ *
+ * *val is not meaningful when the result is WJB_DONE, WJB_END_ARRAY or
+ * WJB_END_OBJECT.  However, we set val->type = jbvNull in those cases,
+ * so that callers may assume that val->type is always well-defined.
  */
 JsonbIteratorToken
 JsonbIteratorNext(JsonbIterator **it, JsonbValue *val, bool skipNested)
 {
 	if (*it == NULL)
+	{
+		val->type = jbvNull;
 		return WJB_DONE;
+	}
 
 	/*
 	 * When stepping into a nested container, we jump back here to start
@@ -898,6 +897,7 @@ recurse:
 				 * nesting).
 				 */
 				*it = freeAndGetParent(*it);
+				val->type = jbvNull;
 				return WJB_END_ARRAY;
 			}
 
@@ -951,6 +951,7 @@ recurse:
 				 * of nesting).
 				 */
 				*it = freeAndGetParent(*it);
+				val->type = jbvNull;
 				return WJB_END_OBJECT;
 			}
 			else
@@ -995,8 +996,10 @@ recurse:
 				return WJB_VALUE;
 	}
 
-	elog(ERROR, "invalid iterator state");
-	return -1;
+	elog(ERROR, "invalid jsonb iterator state");
+	/* satisfy compilers that don't know that elog(ERROR) doesn't return */
+	val->type = jbvNull;
+	return WJB_DONE;
 }
 
 /*
@@ -1508,7 +1511,7 @@ reserveFromBuffer(StringInfo buffer, int len)
  * Copy 'len' bytes to a previously reserved area in buffer.
  */
 static void
-copyToBuffer(StringInfo buffer, int offset, const char *data, int len)
+copyToBuffer(StringInfo buffer, int offset, const void *data, int len)
 {
 	memcpy(buffer->data + offset, data, len);
 }
@@ -1517,7 +1520,7 @@ copyToBuffer(StringInfo buffer, int offset, const char *data, int len)
  * A shorthand for reserveFromBuffer + copyToBuffer.
  */
 static void
-appendToBuffer(StringInfo buffer, const char *data, int len)
+appendToBuffer(StringInfo buffer, const void *data, int len)
 {
 	int			offset;
 
@@ -1646,7 +1649,7 @@ convertJsonbArray(StringInfo buffer, JEntry *header, JsonbValue *val, int level)
 		containerhead |= JB_FSCALAR;
 	}
 
-	appendToBuffer(buffer, (char *) &containerhead, sizeof(uint32));
+	appendToBuffer(buffer, &containerhead, sizeof(uint32));
 
 	/* Reserve space for the JEntries of the elements. */
 	jentry_offset = reserveFromBuffer(buffer, sizeof(JEntry) * nElems);
@@ -1684,7 +1687,7 @@ convertJsonbArray(StringInfo buffer, JEntry *header, JsonbValue *val, int level)
 		if ((i % JB_OFFSET_STRIDE) == 0)
 			meta = (meta & JENTRY_TYPEMASK) | totallen | JENTRY_HAS_OFF;
 
-		copyToBuffer(buffer, jentry_offset, (char *) &meta, sizeof(JEntry));
+		copyToBuffer(buffer, jentry_offset, &meta, sizeof(JEntry));
 		jentry_offset += sizeof(JEntry);
 	}
 
@@ -1723,7 +1726,7 @@ convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *val, int level
 	 * variable-length payload.
 	 */
 	containerheader = nPairs | JB_FOBJECT;
-	appendToBuffer(buffer, (char *) &containerheader, sizeof(uint32));
+	appendToBuffer(buffer, &containerheader, sizeof(uint32));
 
 	/* Reserve space for the JEntries of the keys and values. */
 	jentry_offset = reserveFromBuffer(buffer, sizeof(JEntry) * nPairs * 2);
@@ -1765,7 +1768,7 @@ convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *val, int level
 		if ((i % JB_OFFSET_STRIDE) == 0)
 			meta = (meta & JENTRY_TYPEMASK) | totallen | JENTRY_HAS_OFF;
 
-		copyToBuffer(buffer, jentry_offset, (char *) &meta, sizeof(JEntry));
+		copyToBuffer(buffer, jentry_offset, &meta, sizeof(JEntry));
 		jentry_offset += sizeof(JEntry);
 	}
 	for (i = 0; i < nPairs; i++)
@@ -1800,7 +1803,7 @@ convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *val, int level
 		if (((i + nPairs) % JB_OFFSET_STRIDE) == 0)
 			meta = (meta & JENTRY_TYPEMASK) | totallen | JENTRY_HAS_OFF;
 
-		copyToBuffer(buffer, jentry_offset, (char *) &meta, sizeof(JEntry));
+		copyToBuffer(buffer, jentry_offset, &meta, sizeof(JEntry));
 		jentry_offset += sizeof(JEntry);
 	}
 
@@ -1840,7 +1843,7 @@ convertJsonbScalar(StringInfo buffer, JEntry *header, JsonbValue *scalarVal)
 			numlen = VARSIZE_ANY(scalarVal->val.numeric);
 			padlen = padBufferToInt(buffer);
 
-			appendToBuffer(buffer, (char *) scalarVal->val.numeric, numlen);
+			appendToBuffer(buffer, scalarVal->val.numeric, numlen);
 
 			*header = JENTRY_ISNUMERIC | (padlen + numlen);
 			break;
