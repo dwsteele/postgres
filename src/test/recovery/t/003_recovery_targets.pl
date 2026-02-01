@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test for recovery targets: name, timestamp, XID
 use strict;
@@ -155,7 +155,9 @@ my $res = run_log(
 ok(!$res, 'invalid recovery startup fails');
 
 my $logfile = slurp_file($node_standby->logfile());
-ok($logfile =~ qr/multiple recovery targets specified/,
+like(
+	$logfile,
+	qr/multiple recovery targets specified/,
 	'multiple conflicting settings');
 
 # Check behavior when recovery ends before target is reached
@@ -183,8 +185,9 @@ foreach my $i (0 .. 10 * $PostgreSQL::Test::Utils::timeout_default)
 	usleep(100_000);
 }
 $logfile = slurp_file($node_standby->logfile());
-ok( $logfile =~
-	  qr/FATAL: .* recovery ended before configured recovery target was reached/,
+like(
+	$logfile,
+	qr/FATAL: .* recovery ended before configured recovery target was reached/,
 	'recovery end before target reached is a fatal error');
 
 # Invalid timeline target

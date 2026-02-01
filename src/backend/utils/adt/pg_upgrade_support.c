@@ -5,7 +5,7 @@
  *	to control oid and relfilenumber assignment, and do other special
  *	hacks needed for pg_upgrade.
  *
- *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/backend/utils/adt/pg_upgrade_support.c
  */
 
@@ -372,7 +372,7 @@ binary_upgrade_replorigin_advance(PG_FUNCTION_ARGS)
 	Oid			subid;
 	char	   *subname;
 	char		originname[NAMEDATALEN];
-	RepOriginId node;
+	ReplOriginId node;
 	XLogRecPtr	remote_commit;
 
 	CHECK_IS_BINARY_UPGRADE;

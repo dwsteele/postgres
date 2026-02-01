@@ -3,7 +3,7 @@
  * execReplication.c
  *	  miscellaneous executor routines for logical replication
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,6 +14,7 @@
 
 #include "postgres.h"
 
+#include "access/amapi.h"
 #include "access/commit_ts.h"
 #include "access/genam.h"
 #include "access/gist.h"
@@ -46,8 +47,8 @@ static bool tuples_equal(TupleTableSlot *slot1, TupleTableSlot *slot2,
  *
  * Returns how many columns to use for the index scan.
  *
- * This is not generic routine, idxrel must be PK, RI, or an index that can be
- * used for REPLICA IDENTITY FULL table. See FindUsableIndexForReplicaIdentityFull()
+ * This is not a generic routine, idxrel must be PK, RI, or an index that can be
+ * used for a REPLICA IDENTITY FULL table. See FindUsableIndexForReplicaIdentityFull()
  * for details.
  *
  * By definition, replication identity of a rel meets all limitations associated
@@ -221,7 +222,7 @@ retry:
 		if (!isIdxSafeToSkipDuplicates)
 		{
 			if (eq == NULL)
-				eq = palloc0(sizeof(*eq) * outslot->tts_tupleDescriptor->natts);
+				eq = palloc0_array(TypeCacheEntry *, outslot->tts_tupleDescriptor->natts);
 
 			if (!tuples_equal(outslot, searchslot, eq, NULL))
 				continue;
@@ -378,7 +379,7 @@ RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode,
 
 	Assert(equalTupleDescs(desc, outslot->tts_tupleDescriptor));
 
-	eq = palloc0(sizeof(*eq) * outslot->tts_tupleDescriptor->natts);
+	eq = palloc0_array(TypeCacheEntry *, outslot->tts_tupleDescriptor->natts);
 
 	/* Start a heap scan. */
 	InitDirtySnapshot(snap);
@@ -479,7 +480,7 @@ update_most_recent_deletion_info(TupleTableSlot *scanslot,
 								 TransactionId oldestxmin,
 								 TransactionId *delete_xid,
 								 TimestampTz *delete_time,
-								 RepOriginId *delete_origin)
+								 ReplOriginId *delete_origin)
 {
 	BufferHeapTupleTableSlot *hslot;
 	HeapTuple	tuple;
@@ -487,7 +488,7 @@ update_most_recent_deletion_info(TupleTableSlot *scanslot,
 	bool		recently_dead = false;
 	TransactionId xmax;
 	TimestampTz localts;
-	RepOriginId localorigin;
+	ReplOriginId localorigin;
 
 	hslot = (BufferHeapTupleTableSlot *) scanslot;
 
@@ -561,7 +562,7 @@ bool
 RelationFindDeletedTupleInfoSeq(Relation rel, TupleTableSlot *searchslot,
 								TransactionId oldestxmin,
 								TransactionId *delete_xid,
-								RepOriginId *delete_origin,
+								ReplOriginId *delete_origin,
 								TimestampTz *delete_time)
 {
 	TupleTableSlot *scanslot;
@@ -573,7 +574,7 @@ RelationFindDeletedTupleInfoSeq(Relation rel, TupleTableSlot *searchslot,
 	Assert(equalTupleDescs(desc, searchslot->tts_tupleDescriptor));
 
 	*delete_xid = InvalidTransactionId;
-	*delete_origin = InvalidRepOriginId;
+	*delete_origin = InvalidReplOriginId;
 	*delete_time = 0;
 
 	/*
@@ -582,7 +583,7 @@ RelationFindDeletedTupleInfoSeq(Relation rel, TupleTableSlot *searchslot,
 	 * IsIndexUsableForFindingDeletedTuple), a full table scan becomes
 	 * necessary. In such cases, comparing the entire tuple is not required,
 	 * since the remote tuple might not include all column values. Instead,
-	 * the indexed columns alone are suffcient to identify the target tuple
+	 * the indexed columns alone are sufficient to identify the target tuple
 	 * (see logicalrep_rel_mark_updatable).
 	 */
 	indexbitmap = RelationGetIndexAttrBitmap(rel,
@@ -593,7 +594,7 @@ RelationFindDeletedTupleInfoSeq(Relation rel, TupleTableSlot *searchslot,
 		indexbitmap = RelationGetIndexAttrBitmap(rel,
 												 INDEX_ATTR_BITMAP_PRIMARY_KEY);
 
-	eq = palloc0(sizeof(*eq) * searchslot->tts_tupleDescriptor->natts);
+	eq = palloc0_array(TypeCacheEntry *, searchslot->tts_tupleDescriptor->natts);
 
 	/*
 	 * Start a heap scan using SnapshotAny to identify dead tuples that are
@@ -631,7 +632,7 @@ RelationFindDeletedTupleInfoByIndex(Relation rel, Oid idxoid,
 									TupleTableSlot *searchslot,
 									TransactionId oldestxmin,
 									TransactionId *delete_xid,
-									RepOriginId *delete_origin,
+									ReplOriginId *delete_origin,
 									TimestampTz *delete_time)
 {
 	Relation	idxrel;
@@ -648,7 +649,7 @@ RelationFindDeletedTupleInfoByIndex(Relation rel, Oid idxoid,
 
 	*delete_xid = InvalidTransactionId;
 	*delete_time = 0;
-	*delete_origin = InvalidRepOriginId;
+	*delete_origin = InvalidReplOriginId;
 
 	isIdxSafeToSkipDuplicates = (GetRelationIdentityOrPK(rel) == idxoid);
 
@@ -679,7 +680,7 @@ RelationFindDeletedTupleInfoByIndex(Relation rel, Oid idxoid,
 		if (!isIdxSafeToSkipDuplicates)
 		{
 			if (eq == NULL)
-				eq = palloc0(sizeof(*eq) * scanslot->tts_tupleDescriptor->natts);
+				eq = palloc0_array(TypeCacheEntry *, scanslot->tts_tupleDescriptor->natts);
 
 			if (!tuples_equal(scanslot, searchslot, eq, NULL))
 				continue;
@@ -852,10 +853,10 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 												   conflictindexes, false);
 
 		/*
-		 * Checks the conflict indexes to fetch the conflicting local tuple
-		 * and reports the conflict. We perform this check here, instead of
+		 * Checks the conflict indexes to fetch the conflicting local row and
+		 * reports the conflict. We perform this check here, instead of
 		 * performing an additional index scan before the actual insertion and
-		 * reporting the conflict if any conflicting tuples are found. This is
+		 * reporting the conflict if any conflicting rows are found. This is
 		 * to avoid the overhead of executing the extra scan for each INSERT
 		 * operation, even when no conflict arises, which could introduce
 		 * significant overhead to replication, particularly in cases where
@@ -1112,18 +1113,36 @@ CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
 
 
 /*
- * Check if we support writing into specific relkind.
+ * Check if we support writing into specific relkind of local relation and check
+ * if it aligns with the relkind of the relation on the publisher.
  *
  * The nspname and relname are only needed for error reporting.
  */
 void
-CheckSubscriptionRelkind(char relkind, const char *nspname,
-						 const char *relname)
+CheckSubscriptionRelkind(char localrelkind, char remoterelkind,
+						 const char *nspname, const char *relname)
 {
-	if (relkind != RELKIND_RELATION && relkind != RELKIND_PARTITIONED_TABLE)
+	if (localrelkind != RELKIND_RELATION &&
+		localrelkind != RELKIND_PARTITIONED_TABLE &&
+		localrelkind != RELKIND_SEQUENCE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot use relation \"%s.%s\" as logical replication target",
 						nspname, relname),
-				 errdetail_relkind_not_supported(relkind)));
+				 errdetail_relkind_not_supported(localrelkind)));
+
+	/*
+	 * Allow RELKIND_RELATION and RELKIND_PARTITIONED_TABLE to be treated
+	 * interchangeably, but ensure that sequences (RELKIND_SEQUENCE) match
+	 * exactly on both publisher and subscriber.
+	 */
+	if ((localrelkind == RELKIND_SEQUENCE && remoterelkind != RELKIND_SEQUENCE) ||
+		(localrelkind != RELKIND_SEQUENCE && remoterelkind == RELKIND_SEQUENCE))
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+		/* translator: 3rd and 4th %s are "sequence" or "table" */
+				errmsg("relation \"%s.%s\" type mismatch: source \"%s\", target \"%s\"",
+					   nspname, relname,
+					   remoterelkind == RELKIND_SEQUENCE ? "sequence" : "table",
+					   localrelkind == RELKIND_SEQUENCE ? "sequence" : "table"));
 }

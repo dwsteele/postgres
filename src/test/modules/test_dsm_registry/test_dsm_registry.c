@@ -3,7 +3,7 @@
  * test_dsm_registry.c
  *	  Test the dynamic shared memory registry.
  *
- * Copyright (c) 2024-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_dsm_registry/test_dsm_registry.c
@@ -44,11 +44,14 @@ static const dshash_parameters dsh_params = {
 };
 
 static void
-init_tdr_dsm(void *ptr)
+init_tdr_dsm(void *ptr, void *arg)
 {
 	TestDSMRegistryStruct *dsm = (TestDSMRegistryStruct *) ptr;
 
-	LWLockInitialize(&dsm->lck, LWLockNewTrancheId());
+	if ((int) (intptr_t) arg != 5432)
+		elog(ERROR, "unexpected arg value %d", (int) (intptr_t) arg);
+
+	LWLockInitialize(&dsm->lck, LWLockNewTrancheId("test_dsm_registry"));
 	dsm->val = 0;
 }
 
@@ -60,8 +63,7 @@ tdr_attach_shmem(void)
 	tdr_dsm = GetNamedDSMSegment("test_dsm_registry_dsm",
 								 sizeof(TestDSMRegistryStruct),
 								 init_tdr_dsm,
-								 &found);
-	LWLockRegisterTranche(tdr_dsm->lck.tranche, "test_dsm_registry");
+								 &found, (void *) (intptr_t) 5432);
 
 	if (tdr_dsa == NULL)
 		tdr_dsa = GetNamedDSA("test_dsm_registry_dsa", &found);
