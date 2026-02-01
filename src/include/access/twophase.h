@@ -4,7 +4,7 @@
  *	  Two-phase-commit related declarations.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/twophase.h
@@ -58,7 +58,7 @@ extern void FinishPreparedTransaction(const char *gid, bool isCommit);
 
 extern void PrepareRedoAdd(FullTransactionId fxid, char *buf,
 						   XLogRecPtr start_lsn, XLogRecPtr end_lsn,
-						   RepOriginId origin_id);
+						   ReplOriginId origin_id);
 extern void PrepareRedoRemove(TransactionId xid, bool giveWarning);
 extern void restoreTwoPhaseData(void);
 extern bool LookupGXact(const char *gid, XLogRecPtr prepare_end_lsn,
@@ -67,5 +67,7 @@ extern bool LookupGXact(const char *gid, XLogRecPtr prepare_end_lsn,
 extern void TwoPhaseTransactionGid(Oid subid, TransactionId xid, char *gid_res,
 								   int szgid);
 extern bool LookupGXactBySubid(Oid subid);
+
+extern TransactionId TwoPhaseGetOldestXidInCommit(void);
 
 #endif							/* TWOPHASE_H */

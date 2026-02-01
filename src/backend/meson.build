@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 backend_build_deps = [backend_code]
 backend_sources = []
@@ -141,7 +141,7 @@ postgres = executable('postgres',
 backend_targets += postgres
 
 pg_mod_c_args = cflags_mod
-pg_mod_cpp_args = cxxflags_mod
+pg_mod_cxx_args = cxxflags_mod
 pg_mod_link_args = ldflags_sl + ldflags_mod
 pg_mod_link_depend = []
 
@@ -169,14 +169,14 @@ backend_mod_code = declare_dependency(
   compile_args: pg_mod_c_args,
   include_directories: postgres_inc,
   link_args: pg_mod_link_args,
-  sources: generated_headers + generated_backend_headers,
+  sources: generated_backend_headers_stamp,
   dependencies: backend_mod_deps,
 )
 
 # normal extension modules
 pg_mod_args = default_mod_args + {
   'dependencies': [backend_mod_code],
-  'cpp_args': pg_mod_cpp_args,
+  'cpp_args': pg_mod_cxx_args,
   'link_depends': pg_mod_link_depend,
 }
 

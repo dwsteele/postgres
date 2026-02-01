@@ -1,14 +1,16 @@
-use strict;
-use warnings;
-use PostgreSQL::Test::Cluster;
-use Test::More;
-
+# Copyright (c) 2025-2026, PostgreSQL Global Development Group
+#
 # Test that vacuum prunes away all dead tuples killed before OldestXmin
 #
 # This test creates a table on a primary, updates the table to generate dead
 # tuples for vacuum, and then, during the vacuum, uses the replica to force
 # GlobalVisState->maybe_needed on the primary to move backwards and precede
 # the value of OldestXmin set at the beginning of vacuuming the table.
+
+use strict;
+use warnings;
+use PostgreSQL::Test::Cluster;
+use Test::More;
 
 # Set up nodes
 my $node_primary = PostgreSQL::Test::Cluster->new('primary');
@@ -52,7 +54,7 @@ my $psql_primaryB =
 
 # Our test relies on two rounds of index vacuuming for reasons elaborated
 # later. To trigger two rounds of index vacuuming, we must fill up the
-# TIDStore with dead items partway through a vacuum of the table. The number
+# TidStore with dead items partway through a vacuum of the table. The number
 # of rows is just enough to ensure we exceed maintenance_work_mem on all
 # supported platforms, while keeping test runtime as short as we can.
 my $nrows = 2000;
@@ -192,7 +194,7 @@ $node_primary->poll_query_until(
 	qq[
 	SELECT count(*) >= 1 FROM pg_stat_activity
 		WHERE pid = $vacuum_pid
-		AND wait_event = 'BufferPin';
+		AND wait_event = 'BufferCleanup';
 	],
 	't');
 
@@ -223,7 +225,7 @@ $node_primary->poll_query_until(
 
 # Move the cursor forward to the next 7. We inserted the 7 much later, so
 # advancing the cursor should allow vacuum to proceed vacuuming most pages of
-# the relation. Because we set maintanence_work_mem sufficiently low, we
+# the relation. Because we set maintenance_work_mem sufficiently low, we
 # expect that a round of index vacuuming has happened and that the vacuum is
 # now waiting for the cursor to release its pin on the last page of the
 # relation.

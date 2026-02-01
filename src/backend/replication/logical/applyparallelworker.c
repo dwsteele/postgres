@@ -2,7 +2,7 @@
  * applyparallelworker.c
  *	   Support routines for applying xact by parallel apply worker
  *
- * Copyright (c) 2023-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2023-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/applyparallelworker.c
@@ -299,7 +299,7 @@ pa_can_start(void)
 	 * STREAM START message, and it doesn't seem worth sending the extra eight
 	 * bytes with the STREAM START to enable parallelism for this case.
 	 */
-	if (!XLogRecPtrIsInvalid(MySubscription->skiplsn))
+	if (XLogRecPtrIsValid(MySubscription->skiplsn))
 		return false;
 
 	/*
@@ -425,7 +425,7 @@ pa_launch_parallel_worker(void)
 	 */
 	oldcontext = MemoryContextSwitchTo(ApplyContext);
 
-	winfo = (ParallelApplyWorkerInfo *) palloc0(sizeof(ParallelApplyWorkerInfo));
+	winfo = palloc0_object(ParallelApplyWorkerInfo);
 
 	/* Setup shared memory. */
 	if (!pa_setup_dsm(winfo))
@@ -640,7 +640,7 @@ pa_detach_all_error_mq(void)
  * Check if there are any pending spooled messages.
  */
 static bool
-pa_has_spooled_message_pending()
+pa_has_spooled_message_pending(void)
 {
 	PartialFileSetState fileset_state;
 
@@ -864,16 +864,23 @@ ParallelApplyWorkerMain(Datum main_arg)
 	shm_mq	   *mq;
 	shm_mq_handle *mqh;
 	shm_mq_handle *error_mqh;
-	RepOriginId originid;
+	ReplOriginId originid;
 	int			worker_slot = DatumGetInt32(main_arg);
 	char		originname[NAMEDATALEN];
 
 	InitializingApplyWorker = true;
 
-	/* Setup signal handling. */
+	/*
+	 * Setup signal handling.
+	 *
+	 * Note: We intentionally used SIGUSR2 to trigger a graceful shutdown
+	 * initiated by the leader apply worker. This helps to differentiate it
+	 * from the case where we abort the current transaction and exit on
+	 * receiving SIGTERM.
+	 */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
-	pqsignal(SIGINT, SignalHandlerForShutdownRequest);
 	pqsignal(SIGTERM, die);
+	pqsignal(SIGUSR2, SignalHandlerForShutdownRequest);
 	BackgroundWorkerUnblockSignals();
 
 	/*
@@ -955,7 +962,7 @@ ParallelApplyWorkerMain(Datum main_arg)
 	 * origin which was already acquired by its leader process.
 	 */
 	replorigin_session_setup(originid, MyLogicalRepWorker->leader_pid);
-	replorigin_session_origin = originid;
+	replorigin_xact_state.origin = originid;
 	CommitTransactionCommand();
 
 	/*
@@ -963,7 +970,7 @@ ParallelApplyWorkerMain(Datum main_arg)
 	 * the subscription relation state.
 	 */
 	CacheRegisterSyscacheCallback(SUBSCRIPTIONRELMAP,
-								  invalidate_syncing_table_states,
+								  InvalidateSyncingRelStates,
 								  (Datum) 0);
 
 	set_apply_error_context_origin(originname);
@@ -972,9 +979,9 @@ ParallelApplyWorkerMain(Datum main_arg)
 
 	/*
 	 * The parallel apply worker must not get here because the parallel apply
-	 * worker will only stop when it receives a SIGTERM or SIGINT from the
-	 * leader, or when there is an error. None of these cases will allow the
-	 * code to reach here.
+	 * worker will only stop when it receives a SIGTERM or SIGUSR2 from the
+	 * leader, or SIGINT from itself, or when there is an error. None of these
+	 * cases will allow the code to reach here.
 	 */
 	Assert(false);
 }
@@ -1007,7 +1014,7 @@ ProcessParallelApplyMessage(StringInfo msg)
 
 	switch (msgtype)
 	{
-		case 'E':				/* ErrorResponse */
+		case PqMsg_ErrorResponse:
 			{
 				ErrorData	edata;
 
@@ -1044,11 +1051,11 @@ ProcessParallelApplyMessage(StringInfo msg)
 
 			/*
 			 * Don't need to do anything about NoticeResponse and
-			 * NotifyResponse as the logical replication worker doesn't need
-			 * to send messages to the client.
+			 * NotificationResponse as the logical replication worker doesn't
+			 * need to send messages to the client.
 			 */
-		case 'N':
-		case 'A':
+		case PqMsg_NoticeResponse:
+		case PqMsg_NotificationResponse:
 			break;
 
 		default:
@@ -1423,8 +1430,8 @@ pa_stream_abort(LogicalRepStreamAbortData *abort_data)
 	 * Update origin state so we can restart streaming from correct position
 	 * in case of crash.
 	 */
-	replorigin_session_origin_lsn = abort_data->abort_lsn;
-	replorigin_session_origin_timestamp = abort_data->abort_time;
+	replorigin_xact_state.origin_lsn = abort_data->abort_lsn;
+	replorigin_xact_state.origin_timestamp = abort_data->abort_time;
 
 	/*
 	 * If the two XIDs are the same, it's in fact abort of toplevel xact, so
@@ -1633,7 +1640,7 @@ pa_xact_finish(ParallelApplyWorkerInfo *winfo, XLogRecPtr remote_lsn)
 	 */
 	pa_wait_for_xact_finish(winfo);
 
-	if (!XLogRecPtrIsInvalid(remote_lsn))
+	if (XLogRecPtrIsValid(remote_lsn))
 		store_flush_position(remote_lsn, winfo->shared->last_commit_end);
 
 	pa_free_worker(winfo);

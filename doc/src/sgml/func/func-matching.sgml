@@ -152,14 +152,6 @@
     character itself, write two escape characters.
    </para>
 
-   <note>
-    <para>
-     If you have <xref linkend="guc-standard-conforming-strings"/> turned off,
-     any backslashes you write in literal string constants will need to be
-     doubled.  See <xref linkend="sql-syntax-strings"/> for more information.
-    </para>
-   </note>
-
    <para>
     It's also possible to select no escape character by writing
     <literal>ESCAPE ''</literal>.  This effectively disables the
@@ -369,11 +361,11 @@
     regular expression pattern.  The function can be written according
     to standard SQL syntax:
 <synopsis>
-substring(<replaceable>string</replaceable> similar <replaceable>pattern</replaceable> escape <replaceable>escape-character</replaceable>)
+substring(<replaceable>string</replaceable> SIMILAR <replaceable>pattern</replaceable> ESCAPE <replaceable>escape-character</replaceable>)
 </synopsis>
     or using the now obsolete SQL:1999 syntax:
 <synopsis>
-substring(<replaceable>string</replaceable> from <replaceable>pattern</replaceable> for <replaceable>escape-character</replaceable>)
+substring(<replaceable>string</replaceable> FROM <replaceable>pattern</replaceable> FOR <replaceable>escape-character</replaceable>)
 </synopsis>
     or as a plain three-argument function:
 <synopsis>
@@ -412,8 +404,8 @@ substring(<replaceable>string</replaceable>, <replaceable>pattern</replaceable>,
    <para>
     Some examples, with <literal>#&quot;</literal> delimiting the return string:
 <programlisting>
-substring('foobar' similar '%#"o_b#"%' escape '#')   <lineannotation>oob</lineannotation>
-substring('foobar' similar '#"o_b#"%' escape '#')    <lineannotation>NULL</lineannotation>
+substring('foobar' SIMILAR '%#"o_b#"%' ESCAPE '#')   <lineannotation>oob</lineannotation>
+substring('foobar' SIMILAR '#"o_b#"%' ESCAPE '#')    <lineannotation>NULL</lineannotation>
 </programlisting>
    </para>
   </sect2>
@@ -600,8 +592,8 @@ substring('foobar' similar '#"o_b#"%' escape '#')    <lineannotation>NULL</linea
    <para>
     Some examples:
 <programlisting>
-substring('foobar' from 'o.b')     <lineannotation>oob</lineannotation>
-substring('foobar' from 'o(.)b')   <lineannotation>o</lineannotation>
+substring('foobar' FROM 'o.b')     <lineannotation>oob</lineannotation>
+substring('foobar' FROM 'o(.)b')   <lineannotation>o</lineannotation>
 </programlisting>
    </para>
 
@@ -1084,6 +1076,8 @@ regexp_substr('ABCDEFGHI', '(c..)(...)', 1, 1, 'i', 2)
     <title>Regular Expression Atoms</title>
 
     <tgroup cols="2">
+     <colspec colname="col1" colwidth="1*"/>
+     <colspec colname="col2" colwidth="3*"/>
      <thead>
       <row>
        <entry>Atom</entry>
@@ -1154,18 +1148,12 @@ regexp_substr('ABCDEFGHI', '(c..)(...)', 1, 1, 'i', 2)
     An RE cannot end with a backslash (<literal>\</literal>).
    </para>
 
-   <note>
-    <para>
-     If you have <xref linkend="guc-standard-conforming-strings"/> turned off,
-     any backslashes you write in literal string constants will need to be
-     doubled.  See <xref linkend="sql-syntax-strings"/> for more information.
-    </para>
-   </note>
-
    <table id="posix-quantifiers-table">
     <title>Regular Expression Quantifiers</title>
 
     <tgroup cols="2">
+     <colspec colname="col1" colwidth="1*"/>
+     <colspec colname="col2" colwidth="3*"/>
      <thead>
       <row>
        <entry>Quantifier</entry>
@@ -1270,6 +1258,8 @@ regexp_substr('ABCDEFGHI', '(c..)(...)', 1, 1, 'i', 2)
     <title>Regular Expression Constraints</title>
 
     <tgroup cols="2">
+     <colspec colname="col1" colwidth="1*"/>
+     <colspec colname="col2" colwidth="3*"/>
      <thead>
       <row>
        <entry>Constraint</entry>
@@ -1508,6 +1498,8 @@ regexp_substr('ABCDEFGHI', '(c..)(...)', 1, 1, 'i', 2)
     <title>Regular Expression Character-Entry Escapes</title>
 
     <tgroup cols="2">
+     <colspec colname="col1" colwidth="1*"/>
+     <colspec colname="col2" colwidth="3*"/>
      <thead>
       <row>
        <entry>Escape</entry>
@@ -1649,7 +1641,9 @@ regexp_substr('ABCDEFGHI', '(c..)(...)', 1, 1, 'i', 2)
     <title>Regular Expression Class-Shorthand Escapes</title>
 
     <tgroup cols="2">
-     <thead>
+      <colspec colname="col1" colwidth="1*"/>
+      <colspec colname="col2" colwidth="3*"/>
+      <thead>
       <row>
        <entry>Escape</entry>
        <entry>Description</entry>
@@ -1708,6 +1702,8 @@ regexp_substr('ABCDEFGHI', '(c..)(...)', 1, 1, 'i', 2)
     <title>Regular Expression Constraint Escapes</title>
 
     <tgroup cols="2">
+     <colspec colname="col1" colwidth="1*"/>
+     <colspec colname="col2" colwidth="3*"/>
      <thead>
       <row>
        <entry>Escape</entry>
@@ -1764,6 +1760,8 @@ regexp_substr('ABCDEFGHI', '(c..)(...)', 1, 1, 'i', 2)
     <title>Regular Expression Back References</title>
 
     <tgroup cols="2">
+     <colspec colname="col1" colwidth="1*"/>
+     <colspec colname="col2" colwidth="3*"/>
      <thead>
       <row>
        <entry>Escape</entry>
@@ -1845,6 +1843,8 @@ regexp_substr('ABCDEFGHI', '(c..)(...)', 1, 1, 'i', 2)
     <title>ARE Embedded-Option Letters</title>
 
     <tgroup cols="2">
+     <colspec colname="col1" colwidth="1*"/>
+     <colspec colname="col2" colwidth="3*"/>
      <thead>
       <row>
        <entry>Option</entry>

@@ -2,7 +2,7 @@
  *
  * pg_dumpall.c
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * pg_dumpall forces all pg_dump output to be text, since it also outputs
@@ -122,6 +122,8 @@ static char *filename = NULL;
 static SimpleStringList database_exclude_patterns = {NULL, NULL};
 static SimpleStringList database_exclude_names = {NULL, NULL};
 
+static char *restrict_key;
+
 int
 main(int argc, char *argv[])
 {
@@ -184,6 +186,7 @@ main(int argc, char *argv[])
 		{"statistics-only", no_argument, &statistics_only, 1},
 		{"filter", required_argument, NULL, 8},
 		{"sequence-data", no_argument, &sequence_data, 1},
+		{"restrict-key", required_argument, NULL, 9},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -201,7 +204,6 @@ main(int argc, char *argv[])
 	bool		tablespaces_only = false;
 	PGconn	   *conn;
 	int			encoding;
-	const char *std_strings;
 	int			c,
 				ret;
 	int			optindex;
@@ -371,6 +373,12 @@ main(int argc, char *argv[])
 				read_dumpall_filters(optarg, &database_exclude_patterns);
 				break;
 
+			case 9:
+				restrict_key = pg_strdup(optarg);
+				appendPQExpBufferStr(pgdumpopts, " --restrict-key ");
+				appendShellString(pgdumpopts, optarg);
+				break;
+
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -390,7 +398,9 @@ main(int argc, char *argv[])
 	if (database_exclude_patterns.head != NULL &&
 		(globals_only || roles_only || tablespaces_only))
 	{
-		pg_log_error("option --exclude-database cannot be used together with -g/--globals-only, -r/--roles-only, or -t/--tablespaces-only");
+		pg_log_error("option %s cannot be used together with %s, %s, or %s",
+					 "--exclude-database",
+					 "-g/--globals-only", "-r/--roles-only", "-t/--tablespaces-only");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
@@ -398,24 +408,28 @@ main(int argc, char *argv[])
 	/* Make sure the user hasn't specified a mix of globals-only options */
 	if (globals_only && roles_only)
 	{
-		pg_log_error("options -g/--globals-only and -r/--roles-only cannot be used together");
+		pg_log_error("options %s and %s cannot be used together",
+					 "-g/--globals-only", "-r/--roles-only");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 
 	if (globals_only && tablespaces_only)
 	{
-		pg_log_error("options -g/--globals-only and -t/--tablespaces-only cannot be used together");
+		pg_log_error("options %s and %s cannot be used together",
+					 "-g/--globals-only", "-t/--tablespaces-only");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 
 	if (if_exists && !output_clean)
-		pg_fatal("option --if-exists requires option -c/--clean");
+		pg_fatal("option %s requires option %s",
+				 "--if-exists", "-c/--clean");
 
 	if (roles_only && tablespaces_only)
 	{
-		pg_log_error("options -r/--roles-only and -t/--tablespaces-only cannot be used together");
+		pg_log_error("options %s and %s cannot be used together",
+					 "-r/--roles-only", "-t/--tablespaces-only");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
@@ -481,6 +495,16 @@ main(int argc, char *argv[])
 		appendPQExpBufferStr(pgdumpopts, " --sequence-data");
 
 	/*
+	 * If you don't provide a restrict key, one will be appointed for you.
+	 */
+	if (!restrict_key)
+		restrict_key = generate_restrict_key();
+	if (!restrict_key)
+		pg_fatal("could not generate restrict key");
+	if (!valid_restrict_key(restrict_key))
+		pg_fatal("invalid restrict key");
+
+	/*
 	 * If there was a database specified on the command line, use that,
 	 * otherwise try to connect to database "postgres", and failing that
 	 * "template1".
@@ -543,14 +567,17 @@ main(int argc, char *argv[])
 	}
 
 	/*
-	 * Get the active encoding and the standard_conforming_strings setting, so
-	 * we know how to escape strings.
+	 * Force standard_conforming_strings on, just in case we are dumping from
+	 * an old server that has it disabled.  Without this, literals in views,
+	 * expressions, etc, would be incorrect for modern servers.
+	 */
+	executeCommand(conn, "SET standard_conforming_strings = on");
+
+	/*
+	 * Get the active encoding, so we know how to escape strings.
 	 */
 	encoding = PQclientEncoding(conn);
 	setFmtEncoding(encoding);
-	std_strings = PQparameterStatus(conn, "standard_conforming_strings");
-	if (!std_strings)
-		std_strings = "off";
 
 	/* Set the role if requested */
 	if (use_role)
@@ -571,6 +598,16 @@ main(int argc, char *argv[])
 		dumpTimestamp("Started on");
 
 	/*
+	 * Enter restricted mode to block any unexpected psql meta-commands.  A
+	 * malicious source might try to inject a variety of things via bogus
+	 * responses to queries.  While we cannot prevent such sources from
+	 * affecting the destination at restore time, we can block psql
+	 * meta-commands so that the client machine that runs psql with the dump
+	 * output remains unaffected.
+	 */
+	fprintf(OPF, "\\restrict %s\n\n", restrict_key);
+
+	/*
 	 * We used to emit \connect postgres here, but that served no purpose
 	 * other than to break things for installations without a postgres
 	 * database.  Everything we're restoring here is a global, so whichever
@@ -580,12 +617,10 @@ main(int argc, char *argv[])
 	/* Restore will need to write to the target cluster */
 	fprintf(OPF, "SET default_transaction_read_only = off;\n\n");
 
-	/* Replicate encoding and std_strings in output */
+	/* Replicate encoding and standard_conforming_strings in output */
 	fprintf(OPF, "SET client_encoding = '%s';\n",
 			pg_encoding_to_char(encoding));
-	fprintf(OPF, "SET standard_conforming_strings = %s;\n", std_strings);
-	if (strcmp(std_strings, "off") == 0)
-		fprintf(OPF, "SET escape_string_warning = off;\n");
+	fprintf(OPF, "SET standard_conforming_strings = on;\n");
 	fprintf(OPF, "\n");
 
 	if (!data_only && !statistics_only && !no_schema)
@@ -629,6 +664,12 @@ main(int argc, char *argv[])
 		if (!roles_only && !no_tablespaces)
 			dumpTablespaces(conn);
 	}
+
+	/*
+	 * Exit restricted mode just before dumping the databases.  pg_dump will
+	 * handle entering restricted mode again as appropriate.
+	 */
+	fprintf(OPF, "\\unrestrict %s\n\n", restrict_key);
 
 	if (!globals_only && !roles_only && !tablespaces_only)
 		dumpDatabases(conn);
@@ -702,6 +743,7 @@ help(void)
 	printf(_("  --no-unlogged-table-data     do not dump unlogged table data\n"));
 	printf(_("  --on-conflict-do-nothing     add ON CONFLICT DO NOTHING to INSERT commands\n"));
 	printf(_("  --quote-all-identifiers      quote all identifiers, even if not key words\n"));
+	printf(_("  --restrict-key=RESTRICT_KEY  use provided string as psql \\restrict key\n"));
 	printf(_("  --rows-per-insert=NROWS      number of rows per INSERT; implies --inserts\n"));
 	printf(_("  --sequence-data              include sequence data in dump\n"));
 	printf(_("  --statistics                 dump the statistics\n"));
@@ -1492,7 +1534,13 @@ dumpUserConfig(PGconn *conn, const char *username)
 	res = executeQuery(conn, buf->data);
 
 	if (PQntuples(res) > 0)
-		fprintf(OPF, "\n--\n-- User Config \"%s\"\n--\n\n", username);
+	{
+		char	   *sanitized;
+
+		sanitized = sanitize_line(username, true);
+		fprintf(OPF, "\n--\n-- User Config \"%s\"\n--\n\n", sanitized);
+		free(sanitized);
+	}
 
 	for (int i = 0; i < PQntuples(res); i++)
 	{
@@ -1594,6 +1642,7 @@ dumpDatabases(PGconn *conn)
 	for (i = 0; i < PQntuples(res); i++)
 	{
 		char	   *dbname = PQgetvalue(res, i, 0);
+		char	   *sanitized;
 		const char *create_opts;
 		int			ret;
 
@@ -1610,7 +1659,9 @@ dumpDatabases(PGconn *conn)
 
 		pg_log_info("dumping database \"%s\"", dbname);
 
-		fprintf(OPF, "--\n-- Database \"%s\" dump\n--\n\n", dbname);
+		sanitized = sanitize_line(dbname, true);
+		fprintf(OPF, "--\n-- Database \"%s\" dump\n--\n\n", sanitized);
+		free(sanitized);
 
 		/*
 		 * We assume that "template1" and "postgres" already exist in the

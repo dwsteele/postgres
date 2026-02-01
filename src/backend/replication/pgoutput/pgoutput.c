@@ -3,7 +3,7 @@
  * pgoutput.c
  *		Logical Replication output plugin
  *
- * Copyright (c) 2012-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/backend/replication/pgoutput/pgoutput.c
@@ -59,7 +59,7 @@ static void pgoutput_message(LogicalDecodingContext *ctx,
 							 bool transactional, const char *prefix,
 							 Size sz, const char *message);
 static bool pgoutput_origin_filter(LogicalDecodingContext *ctx,
-								   RepOriginId origin_id);
+								   ReplOriginId origin_id);
 static void pgoutput_begin_prepare_txn(LogicalDecodingContext *ctx,
 									   ReorderBufferTXN *txn);
 static void pgoutput_prepare_txn(LogicalDecodingContext *ctx,
@@ -89,7 +89,7 @@ static List *LoadPublications(List *pubnames);
 static void publication_invalidation_cb(Datum arg, int cacheid,
 										uint32 hashvalue);
 static void send_repl_origin(LogicalDecodingContext *ctx,
-							 RepOriginId origin_id, XLogRecPtr origin_lsn,
+							 ReplOriginId origin_id, XLogRecPtr origin_lsn,
 							 bool send_origin);
 
 /*
@@ -235,6 +235,7 @@ static bool get_schema_sent_in_streamed_txn(RelationSyncEntry *entry,
 											TransactionId xid);
 static void init_tuple_slot(PGOutputData *data, Relation relation,
 							RelationSyncEntry *entry);
+static void pgoutput_memory_context_reset(void *arg);
 
 /* row filter routines */
 static EState *create_estate_for_relation(Relation rel);
@@ -345,7 +346,11 @@ parse_output_parameters(List *options, PGOutputData *data)
 						 errmsg("conflicting or redundant options")));
 			publication_names_given = true;
 
-			if (!SplitIdentifierString(strVal(defel->arg), ',',
+			/*
+			 * Pass a copy of the DefElem->arg since SplitIdentifierString
+			 * modifies its input.
+			 */
+			if (!SplitIdentifierString(pstrdup(strVal(defel->arg)), ',',
 									   &data->publication_names))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_NAME),
@@ -427,14 +432,28 @@ parse_output_parameters(List *options, PGOutputData *data)
 }
 
 /*
+ * Memory context reset callback of PGOutputData->context.
+ */
+static void
+pgoutput_memory_context_reset(void *arg)
+{
+	if (RelationSyncCache)
+	{
+		hash_destroy(RelationSyncCache);
+		RelationSyncCache = NULL;
+	}
+}
+
+/*
  * Initialize this plugin
  */
 static void
 pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 				 bool is_init)
 {
-	PGOutputData *data = palloc0(sizeof(PGOutputData));
+	PGOutputData *data = palloc0_object(PGOutputData);
 	static bool publication_callback_registered = false;
+	MemoryContextCallback *mcallback;
 
 	/* Create our memory context for private allocations. */
 	data->context = AllocSetContextCreate(ctx->context,
@@ -448,6 +467,14 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 	data->pubctx = AllocSetContextCreate(ctx->context,
 										 "logical replication publication list context",
 										 ALLOCSET_SMALL_SIZES);
+
+	/*
+	 * Ensure to cleanup RelationSyncCache even when logical decoding invoked
+	 * via SQL interface ends up with an error.
+	 */
+	mcallback = palloc0_object(MemoryContextCallback);
+	mcallback->func = pgoutput_memory_context_reset;
+	MemoryContextRegisterResetCallback(ctx->context, mcallback);
 
 	ctx->output_plugin_private = data;
 
@@ -582,7 +609,7 @@ pgoutput_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 static void
 pgoutput_send_begin(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 {
-	bool		send_replication_origin = txn->origin_id != InvalidRepOriginId;
+	bool		send_replication_origin = txn->origin_id != InvalidReplOriginId;
 	PGOutputTxnData *txndata = (PGOutputTxnData *) txn->output_plugin_private;
 
 	Assert(txndata);
@@ -636,7 +663,7 @@ pgoutput_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 static void
 pgoutput_begin_prepare_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 {
-	bool		send_replication_origin = txn->origin_id != InvalidRepOriginId;
+	bool		send_replication_origin = txn->origin_id != InvalidReplOriginId;
 
 	OutputPluginPrepareWrite(ctx, !send_replication_origin);
 	logicalrep_write_begin_prepare(ctx->out, txn);
@@ -1046,7 +1073,7 @@ check_and_init_gencol(PGOutputData *data, List *publications,
 	/* Check if there is any generated column present. */
 	for (int i = 0; i < desc->natts; i++)
 	{
-		Form_pg_attribute att = TupleDescAttr(desc, i);
+		CompactAttribute *att = TupleDescCompactAttr(desc, i);
 
 		if (att->attgenerated)
 		{
@@ -1114,9 +1141,9 @@ pgoutput_column_list_init(PGOutputData *data, List *publications,
 	 *
 	 * Note that we don't support the case where the column list is different
 	 * for the same table when combining publications. See comments atop
-	 * fetch_table_list. But one can later change the publication so we still
-	 * need to check all the given publication-table mappings and report an
-	 * error if any publications have a different column list.
+	 * fetch_relation_list. But one can later change the publication so we
+	 * still need to check all the given publication-table mappings and report
+	 * an error if any publications have a different column list.
 	 */
 	foreach(lc, publications)
 	{
@@ -1740,11 +1767,11 @@ pgoutput_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
  */
 static bool
 pgoutput_origin_filter(LogicalDecodingContext *ctx,
-					   RepOriginId origin_id)
+					   ReplOriginId origin_id)
 {
 	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
 
-	if (data->publish_no_origin && origin_id != InvalidRepOriginId)
+	if (data->publish_no_origin && origin_id != InvalidReplOriginId)
 		return true;
 
 	return false;
@@ -1760,11 +1787,7 @@ pgoutput_origin_filter(LogicalDecodingContext *ctx,
 static void
 pgoutput_shutdown(LogicalDecodingContext *ctx)
 {
-	if (RelationSyncCache)
-	{
-		hash_destroy(RelationSyncCache);
-		RelationSyncCache = NULL;
-	}
+	pgoutput_memory_context_reset(NULL);
 }
 
 /*
@@ -1818,7 +1841,7 @@ pgoutput_stream_start(struct LogicalDecodingContext *ctx,
 					  ReorderBufferTXN *txn)
 {
 	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
-	bool		send_replication_origin = txn->origin_id != InvalidRepOriginId;
+	bool		send_replication_origin = txn->origin_id != InvalidReplOriginId;
 
 	/* we can't nest streaming of transactions */
 	Assert(!data->in_streaming);
@@ -1888,7 +1911,7 @@ pgoutput_stream_abort(struct LogicalDecodingContext *ctx,
 
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_stream_abort(ctx->out, toptxn->xid, txn->xid, abort_lsn,
-								  txn->xact_time.abort_time, write_abort_info);
+								  txn->abort_time, write_abort_info);
 
 	OutputPluginWrite(ctx, true);
 
@@ -2434,7 +2457,7 @@ rel_sync_cache_publication_cb(Datum arg, int cacheid, uint32 hashvalue)
 
 /* Send Replication origin */
 static void
-send_repl_origin(LogicalDecodingContext *ctx, RepOriginId origin_id,
+send_repl_origin(LogicalDecodingContext *ctx, ReplOriginId origin_id,
 				 XLogRecPtr origin_lsn, bool send_origin)
 {
 	if (send_origin)

@@ -3,7 +3,7 @@
  * explain.c
  *	  Explain query execution plans
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  * IDENTIFICATION
@@ -147,6 +147,7 @@ static void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
 static void show_wal_usage(ExplainState *es, const WalUsage *usage);
 static void show_memory_counters(ExplainState *es,
 								 const MemoryContextCounters *mem_counters);
+static void show_result_replacement_info(Result *result, ExplainState *es);
 static void ExplainIndexScanDetails(Oid indexid, ScanDirection indexorderdir,
 									ExplainState *es);
 static void ExplainScanTarget(Scan *plan, ExplainState *es);
@@ -350,7 +351,7 @@ standard_ExplainOneQuery(Query *query, int cursorOptions,
 	INSTR_TIME_SET_CURRENT(planstart);
 
 	/* plan the query */
-	plan = pg_plan_query(query, queryString, cursorOptions, params);
+	plan = pg_plan_query(query, queryString, cursorOptions, params, es);
 
 	INSTR_TIME_SET_CURRENT(planduration);
 	INSTR_TIME_SUBTRACT(planduration, planstart);
@@ -1135,7 +1136,8 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 				appendStringInfo(es->str, " on %s", relname);
 			if (es->timing)
 				appendStringInfo(es->str, ": time=%.3f calls=%.0f\n",
-								 1000.0 * instr->total, instr->ntuples);
+								 INSTR_TIME_GET_MILLISEC(instr->total),
+								 instr->ntuples);
 			else
 				appendStringInfo(es->str, ": calls=%.0f\n", instr->ntuples);
 		}
@@ -1146,7 +1148,8 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 				ExplainPropertyText("Constraint Name", conname, es);
 			ExplainPropertyText("Relation", relname, es);
 			if (es->timing)
-				ExplainPropertyFloat("Time", "ms", 1000.0 * instr->total, 3,
+				ExplainPropertyFloat("Time", "ms",
+									 INSTR_TIME_GET_MILLISEC(instr->total), 3,
 									 es);
 			ExplainPropertyFloat("Calls", NULL, instr->ntuples, 0, es);
 		}
@@ -1228,6 +1231,10 @@ ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used)
 		case T_MergeAppend:
 			*rels_used = bms_add_members(*rels_used,
 										 ((MergeAppend *) plan)->apprelids);
+			break;
+		case T_Result:
+			*rels_used = bms_add_members(*rels_used,
+										 ((Result *) plan)->relids);
 			break;
 		default:
 			break;
@@ -1830,8 +1837,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		planstate->instrument && planstate->instrument->nloops > 0)
 	{
 		double		nloops = planstate->instrument->nloops;
-		double		startup_ms = 1000.0 * planstate->instrument->startup / nloops;
-		double		total_ms = 1000.0 * planstate->instrument->total / nloops;
+		double		startup_ms = INSTR_TIME_GET_MILLISEC(planstate->instrument->startup) / nloops;
+		double		total_ms = INSTR_TIME_GET_MILLISEC(planstate->instrument->total) / nloops;
 		double		rows = planstate->instrument->ntuples / nloops;
 
 		if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -1896,8 +1903,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 			if (nloops <= 0)
 				continue;
-			startup_ms = 1000.0 * instrument->startup / nloops;
-			total_ms = 1000.0 * instrument->total / nloops;
+			startup_ms = INSTR_TIME_GET_MILLISEC(instrument->startup) / nloops;
+			total_ms = INSTR_TIME_GET_MILLISEC(instrument->total) / nloops;
 			rows = instrument->ntuples / nloops;
 
 			ExplainOpenWorker(n, es);
@@ -2232,6 +2239,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 								   ancestors, es);
 			break;
 		case T_Result:
+			show_result_replacement_info(castNode(Result, plan), es);
 			show_upper_qual((List *) ((Result *) plan)->resconstantqual,
 							"One-Time Filter", planstate, ancestors, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
@@ -4277,7 +4285,8 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 	{
 		/* Show only positive counter values. */
 		if ((usage->wal_records > 0) || (usage->wal_fpi > 0) ||
-			(usage->wal_bytes > 0) || (usage->wal_buffers_full > 0))
+			(usage->wal_bytes > 0) || (usage->wal_buffers_full > 0) ||
+			(usage->wal_fpi_bytes > 0))
 		{
 			ExplainIndentText(es);
 			appendStringInfoString(es->str, "WAL:");
@@ -4291,6 +4300,9 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 			if (usage->wal_bytes > 0)
 				appendStringInfo(es->str, " bytes=%" PRIu64,
 								 usage->wal_bytes);
+			if (usage->wal_fpi_bytes > 0)
+				appendStringInfo(es->str, " fpi bytes=%" PRIu64,
+								 usage->wal_fpi_bytes);
 			if (usage->wal_buffers_full > 0)
 				appendStringInfo(es->str, " buffers full=%" PRId64,
 								 usage->wal_buffers_full);
@@ -4305,6 +4317,8 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 							   usage->wal_fpi, es);
 		ExplainPropertyUInteger("WAL Bytes", NULL,
 								usage->wal_bytes, es);
+		ExplainPropertyUInteger("WAL FPI Bytes", NULL,
+								usage->wal_fpi_bytes, es);
 		ExplainPropertyInteger("WAL Buffers Full", NULL,
 							   usage->wal_buffers_full, es);
 	}
@@ -4751,6 +4765,102 @@ show_modifytable_info(ModifyTableState *mtstate, List *ancestors,
 }
 
 /*
+ * Explain what a "Result" node replaced.
+ */
+static void
+show_result_replacement_info(Result *result, ExplainState *es)
+{
+	StringInfoData buf;
+	int			nrels = 0;
+	int			rti = -1;
+	bool		found_non_result = false;
+	char	   *replacement_type = "???";
+
+	/* If the Result node has a subplan, it didn't replace anything. */
+	if (result->plan.lefttree != NULL)
+		return;
+
+	/* Gating result nodes should have a subplan, and we don't. */
+	Assert(result->result_type != RESULT_TYPE_GATING);
+
+	switch (result->result_type)
+	{
+		case RESULT_TYPE_GATING:
+			replacement_type = "Gating";
+			break;
+		case RESULT_TYPE_SCAN:
+			replacement_type = "Scan";
+			break;
+		case RESULT_TYPE_JOIN:
+			replacement_type = "Join";
+			break;
+		case RESULT_TYPE_UPPER:
+			/* a small white lie */
+			replacement_type = "Aggregate";
+			break;
+		case RESULT_TYPE_MINMAX:
+			replacement_type = "MinMaxAggregate";
+			break;
+	}
+
+	/*
+	 * Build up a comma-separated list of user-facing names for the range
+	 * table entries in the relids set.
+	 */
+	initStringInfo(&buf);
+	while ((rti = bms_next_member(result->relids, rti)) >= 0)
+	{
+		RangeTblEntry *rte = rt_fetch(rti, es->rtable);
+		char	   *refname;
+
+		/*
+		 * add_outer_joins_to_relids will add join RTIs to the relids set of a
+		 * join; if that join is then replaced with a Result node, we may see
+		 * such RTIs here. But we want to completely ignore those here,
+		 * because "a LEFT JOIN b ON whatever" is a join between a and b, not
+		 * a join between a, b, and an unnamed join.
+		 */
+		if (rte->rtekind == RTE_JOIN)
+			continue;
+
+		/* Count the number of rels that aren't ignored completely. */
+		++nrels;
+
+		/* Work out what reference name to use and add it to the string. */
+		refname = (char *) list_nth(es->rtable_names, rti - 1);
+		if (refname == NULL)
+			refname = rte->eref->aliasname;
+		if (buf.len > 0)
+			appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf, refname);
+
+		/* Keep track of whether we see anything other than RTE_RESULT. */
+		if (rte->rtekind != RTE_RESULT)
+			found_non_result = true;
+	}
+
+	/*
+	 * If this Result node is because of a single RTE that is RTE_RESULT, it
+	 * is not really replacing anything at all, because there's no other
+	 * method for implementing a scan of such an RTE, so we don't display the
+	 * Replaces line in such cases.
+	 */
+	if (nrels <= 1 && !found_non_result &&
+		result->result_type == RESULT_TYPE_SCAN)
+		return;
+
+	/* Say what we replaced, with list of rels if available. */
+	if (buf.len == 0)
+		ExplainPropertyText("Replaces", replacement_type, es);
+	else
+	{
+		char	   *s = psprintf("%s on %s", replacement_type, buf.data);
+
+		ExplainPropertyText("Replaces", s, es);
+	}
+}
+
+/*
  * Explain the constituent plans of an Append, MergeAppend,
  * BitmapAnd, or BitmapOr node.
  *
@@ -4799,6 +4909,7 @@ ExplainSubPlans(List *plans, List *ancestors,
 	{
 		SubPlanState *sps = (SubPlanState *) lfirst(lst);
 		SubPlan    *sp = sps->subplan;
+		char	   *cooked_plan_name;
 
 		/*
 		 * There can be multiple SubPlan nodes referencing the same physical
@@ -4822,8 +4933,20 @@ ExplainSubPlans(List *plans, List *ancestors,
 		 */
 		ancestors = lcons(sp, ancestors);
 
+		/*
+		 * The plan has a name like exists_1 or rowcompare_2, but here we want
+		 * to prefix that with CTE, InitPlan, or SubPlan, as appropriate, for
+		 * display purposes.
+		 */
+		if (sp->subLinkType == CTE_SUBLINK)
+			cooked_plan_name = psprintf("CTE %s", sp->plan_name);
+		else if (sp->isInitPlan)
+			cooked_plan_name = psprintf("InitPlan %s", sp->plan_name);
+		else
+			cooked_plan_name = psprintf("SubPlan %s", sp->plan_name);
+
 		ExplainNode(sps->planstate, ancestors,
-					relationship, sp->plan_name, es);
+					relationship, cooked_plan_name, es);
 
 		ancestors = list_delete_first(ancestors);
 	}
@@ -4859,7 +4982,7 @@ ExplainCreateWorkersState(int num_workers)
 {
 	ExplainWorkersState *wstate;
 
-	wstate = (ExplainWorkersState *) palloc(sizeof(ExplainWorkersState));
+	wstate = palloc_object(ExplainWorkersState);
 	wstate->num_workers = num_workers;
 	wstate->worker_inited = (bool *) palloc0(num_workers * sizeof(bool));
 	wstate->worker_str = (StringInfoData *)

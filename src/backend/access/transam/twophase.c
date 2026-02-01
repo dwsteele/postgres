@@ -3,7 +3,7 @@
  * twophase.c
  *		Two-phase commit support functions.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -103,6 +103,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
@@ -167,7 +168,7 @@ typedef struct GlobalTransactionData
 	bool		ondisk;			/* true if prepare state file is on disk */
 	bool		inredo;			/* true if entry was added via xlog_redo */
 	char		gid[GIDSIZE];	/* The GID assigned to the prepared xact */
-}			GlobalTransactionData;
+} GlobalTransactionData;
 
 /*
  * Two Phase Commit shared state.  Access to this struct is protected
@@ -683,7 +684,7 @@ GetPreparedTransactionList(GlobalTransaction *gxacts)
 	}
 
 	num = TwoPhaseState->numPrepXacts;
-	array = (GlobalTransaction) palloc(sizeof(GlobalTransactionData) * num);
+	array = palloc_array(GlobalTransactionData, num);
 	*gxacts = array;
 	for (i = 0; i < num; i++)
 		memcpy(array + i, TwoPhaseState->prepXacts[i],
@@ -749,7 +750,7 @@ pg_prepared_xact(PG_FUNCTION_ARGS)
 		 * Collect all the 2PC status information that we will format and send
 		 * out as a result set.
 		 */
-		status = (Working_State *) palloc(sizeof(Working_State));
+		status = palloc_object(Working_State);
 		funcctx->user_fctx = status;
 
 		status->ngxacts = GetPreparedTransactionList(&status->array);
@@ -1026,7 +1027,7 @@ save_state_data(const void *data, uint32 len)
 
 	if (padlen > records.bytes_free)
 	{
-		records.tail->next = palloc0(sizeof(StateFileChunk));
+		records.tail->next = palloc0_object(StateFileChunk);
 		records.tail = records.tail->next;
 		records.tail->len = 0;
 		records.tail->next = NULL;
@@ -1036,7 +1037,7 @@ save_state_data(const void *data, uint32 len)
 		records.tail->data = palloc(records.bytes_free);
 	}
 
-	memcpy(((char *) records.tail->data) + records.tail->len, data, len);
+	memcpy(records.tail->data + records.tail->len, data, len);
 	records.tail->len += padlen;
 	records.bytes_free -= padlen;
 	records.total_len += padlen;
@@ -1061,7 +1062,7 @@ StartPrepare(GlobalTransaction gxact)
 	SharedInvalidationMessage *invalmsgs;
 
 	/* Initialize linked list */
-	records.head = palloc0(sizeof(StateFileChunk));
+	records.head = palloc0_object(StateFileChunk);
 	records.head->len = 0;
 	records.head->next = NULL;
 
@@ -1156,13 +1157,13 @@ EndPrepare(GlobalTransaction gxact)
 	Assert(hdr->magic == TWOPHASE_MAGIC);
 	hdr->total_len = records.total_len + sizeof(pg_crc32c);
 
-	replorigin = (replorigin_session_origin != InvalidRepOriginId &&
-				  replorigin_session_origin != DoNotReplicateId);
+	replorigin = (replorigin_xact_state.origin != InvalidReplOriginId &&
+				  replorigin_xact_state.origin != DoNotReplicateId);
 
 	if (replorigin)
 	{
-		hdr->origin_lsn = replorigin_session_origin_lsn;
-		hdr->origin_timestamp = replorigin_session_origin_timestamp;
+		hdr->origin_lsn = replorigin_xact_state.origin_lsn;
+		hdr->origin_timestamp = replorigin_xact_state.origin_timestamp;
 	}
 
 	/*
@@ -1210,7 +1211,7 @@ EndPrepare(GlobalTransaction gxact)
 	if (replorigin)
 	{
 		/* Move LSNs forward for this replication origin */
-		replorigin_session_advance(replorigin_session_origin_lsn,
+		replorigin_session_advance(replorigin_xact_state.origin_lsn,
 								   gxact->prepare_end_lsn);
 	}
 
@@ -1452,7 +1453,7 @@ XlogReadTwoPhaseData(XLogRecPtr lsn, char **buf, int *len)
 	if (len != NULL)
 		*len = XLogRecGetDataLen(xlogreader);
 
-	*buf = palloc(sizeof(char) * XLogRecGetDataLen(xlogreader));
+	*buf = palloc_array(char, XLogRecGetDataLen(xlogreader));
 	memcpy(*buf, XLogRecGetData(xlogreader), sizeof(char) * XLogRecGetDataLen(xlogreader));
 
 	XLogReaderFree(xlogreader);
@@ -1923,7 +1924,7 @@ restoreTwoPhaseData(void)
 				continue;
 
 			PrepareRedoAdd(fxid, buf, InvalidXLogRecPtr,
-						   InvalidXLogRecPtr, InvalidRepOriginId);
+						   InvalidXLogRecPtr, InvalidReplOriginId);
 		}
 	}
 	LWLockRelease(TwoPhaseStateLock);
@@ -2197,7 +2198,7 @@ ProcessTwoPhaseBuffer(FullTransactionId fxid,
 	Assert(LWLockHeldByMeInMode(TwoPhaseStateLock, LW_EXCLUSIVE));
 
 	if (!fromdisk)
-		Assert(prepare_start_lsn != InvalidXLogRecPtr);
+		Assert(XLogRecPtrIsValid(prepare_start_lsn));
 
 	/* Already processed? */
 	if (TransactionIdDidCommit(XidFromFullTransactionId(fxid)) ||
@@ -2329,14 +2330,19 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	 * Are we using the replication origins feature?  Or, in other words, are
 	 * we replaying remote actions?
 	 */
-	replorigin = (replorigin_session_origin != InvalidRepOriginId &&
-				  replorigin_session_origin != DoNotReplicateId);
+	replorigin = (replorigin_xact_state.origin != InvalidReplOriginId &&
+				  replorigin_xact_state.origin != DoNotReplicateId);
+
+	/* Load the injection point before entering the critical section */
+	INJECTION_POINT_LOAD("commit-after-delay-checkpoint");
 
 	START_CRIT_SECTION();
 
 	/* See notes in RecordTransactionCommit */
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_IN_COMMIT;
+
+	INJECTION_POINT_CACHED("commit-after-delay-checkpoint", NULL);
 
 	/*
 	 * Ensures the DELAY_CHKPT_IN_COMMIT flag write is globally visible before
@@ -2370,23 +2376,23 @@ RecordTransactionCommitPrepared(TransactionId xid,
 
 	if (replorigin)
 		/* Move LSNs forward for this replication origin */
-		replorigin_session_advance(replorigin_session_origin_lsn,
+		replorigin_session_advance(replorigin_xact_state.origin_lsn,
 								   XactLastRecEnd);
 
 	/*
 	 * Record commit timestamp.  The value comes from plain commit timestamp
 	 * if replorigin is not enabled, or replorigin already set a value for us
-	 * in replorigin_session_origin_timestamp otherwise.
+	 * in replorigin_xact_state.origin_timestamp otherwise.
 	 *
 	 * We don't need to WAL-log anything here, as the commit record written
 	 * above already contains the data.
 	 */
-	if (!replorigin || replorigin_session_origin_timestamp == 0)
-		replorigin_session_origin_timestamp = committs;
+	if (!replorigin || replorigin_xact_state.origin_timestamp == 0)
+		replorigin_xact_state.origin_timestamp = committs;
 
 	TransactionTreeSetCommitTsData(xid, nchildren, children,
-								   replorigin_session_origin_timestamp,
-								   replorigin_session_origin);
+								   replorigin_xact_state.origin_timestamp,
+								   replorigin_xact_state.origin);
 
 	/*
 	 * We don't currently try to sleep before flush here ... nor is there any
@@ -2439,8 +2445,8 @@ RecordTransactionAbortPrepared(TransactionId xid,
 	 * Are we using the replication origins feature?  Or, in other words, are
 	 * we replaying remote actions?
 	 */
-	replorigin = (replorigin_session_origin != InvalidRepOriginId &&
-				  replorigin_session_origin != DoNotReplicateId);
+	replorigin = (replorigin_xact_state.origin != InvalidReplOriginId &&
+				  replorigin_xact_state.origin != DoNotReplicateId);
 
 	/*
 	 * Catch the scenario where we aborted partway through
@@ -2466,7 +2472,7 @@ RecordTransactionAbortPrepared(TransactionId xid,
 
 	if (replorigin)
 		/* Move LSNs forward for this replication origin */
-		replorigin_session_advance(replorigin_session_origin_lsn,
+		replorigin_session_advance(replorigin_xact_state.origin_lsn,
 								   XactLastRecEnd);
 
 	/* Always flush, since we're about to remove the 2PC state file */
@@ -2500,7 +2506,7 @@ RecordTransactionAbortPrepared(TransactionId xid,
 void
 PrepareRedoAdd(FullTransactionId fxid, char *buf,
 			   XLogRecPtr start_lsn, XLogRecPtr end_lsn,
-			   RepOriginId origin_id)
+			   ReplOriginId origin_id)
 {
 	TwoPhaseFileHeader *hdr = (TwoPhaseFileHeader *) buf;
 	char	   *bufptr;
@@ -2541,7 +2547,7 @@ PrepareRedoAdd(FullTransactionId fxid, char *buf,
 	 * the record is added to TwoPhaseState and it should have no
 	 * corresponding file in pg_twophase.
 	 */
-	if (!XLogRecPtrIsInvalid(start_lsn))
+	if (XLogRecPtrIsValid(start_lsn))
 	{
 		char		path[MAXPGPATH];
 
@@ -2581,7 +2587,7 @@ PrepareRedoAdd(FullTransactionId fxid, char *buf,
 	gxact->owner = hdr->owner;
 	gxact->locking_backend = INVALID_PROC_NUMBER;
 	gxact->valid = false;
-	gxact->ondisk = XLogRecPtrIsInvalid(start_lsn);
+	gxact->ondisk = !XLogRecPtrIsValid(start_lsn);
 	gxact->inredo = true;		/* yes, added in redo */
 	strcpy(gxact->gid, gid);
 
@@ -2589,7 +2595,7 @@ PrepareRedoAdd(FullTransactionId fxid, char *buf,
 	Assert(TwoPhaseState->numPrepXacts < max_prepared_xacts);
 	TwoPhaseState->prepXacts[TwoPhaseState->numPrepXacts++] = gxact;
 
-	if (origin_id != InvalidRepOriginId)
+	if (origin_id != InvalidReplOriginId)
 	{
 		/* recover apply progress */
 		replorigin_advance(origin_id, hdr->origin_lsn, end_lsn,
@@ -2808,4 +2814,59 @@ LookupGXactBySubid(Oid subid)
 	LWLockRelease(TwoPhaseStateLock);
 
 	return found;
+}
+
+/*
+ * TwoPhaseGetOldestXidInCommit
+ *		Return the oldest transaction ID from prepared transactions that are
+ *		currently in the commit critical section.
+ *
+ * This function only considers transactions in the currently connected
+ * database. If no matching transactions are found, it returns
+ * InvalidTransactionId.
+ */
+TransactionId
+TwoPhaseGetOldestXidInCommit(void)
+{
+	TransactionId oldestRunningXid = InvalidTransactionId;
+
+	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
+
+	for (int i = 0; i < TwoPhaseState->numPrepXacts; i++)
+	{
+		GlobalTransaction gxact = TwoPhaseState->prepXacts[i];
+		PGPROC	   *commitproc;
+		TransactionId xid;
+
+		if (!gxact->valid)
+			continue;
+
+		if (gxact->locking_backend == INVALID_PROC_NUMBER)
+			continue;
+
+		/*
+		 * Get the backend that is handling the transaction. It's safe to
+		 * access this backend while holding TwoPhaseStateLock, as the backend
+		 * can only be destroyed after either removing or unlocking the
+		 * current global transaction, both of which require an exclusive
+		 * TwoPhaseStateLock.
+		 */
+		commitproc = GetPGProcByNumber(gxact->locking_backend);
+
+		if (MyDatabaseId != commitproc->databaseId)
+			continue;
+
+		if ((commitproc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0)
+			continue;
+
+		xid = XidFromFullTransactionId(gxact->fxid);
+
+		if (!TransactionIdIsValid(oldestRunningXid) ||
+			TransactionIdPrecedes(xid, oldestRunningXid))
+			oldestRunningXid = xid;
+	}
+
+	LWLockRelease(TwoPhaseStateLock);
+
+	return oldestRunningXid;
 }
