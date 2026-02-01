@@ -5105,16 +5105,31 @@ check_recovery_target_xid(char **newval, void **extra, GucSource source)
 	{
 		TransactionId xid;
 		TransactionId *myextra;
+		uint64        xid64;
+		char          *endp;
 
 		errno = 0;
-		xid = (TransactionId) strtou64(*newval, NULL, 0);
-		if (errno == EINVAL || errno == ERANGE)
+		xid64 = strtou64(*newval, &endp, 0);
+
+		if (*endp != '\0' || errno == EINVAL || errno == ERANGE)
+		{
+			GUC_check_errdetail("\"%s\" is not a valid number.",
+								"recovery_target_xid");
 			return false;
+		}
+
+		if (xid64 < FirstNormalTransactionId || xid64 > MaxTransactionId)
+		{
+			GUC_check_errdetail("\"%s\" must be between %u and %u.",
+								"recovery_target_xid",
+								FirstNormalTransactionId, MaxTransactionId);
+			return false;
+		}
 
 		myextra = (TransactionId *) guc_malloc(LOG, sizeof(TransactionId));
 		if (!myextra)
 			return false;
-		*myextra = xid;
+		*myextra = (TransactionId) xid64;
 		*extra = myextra;
 	}
 	return true;
