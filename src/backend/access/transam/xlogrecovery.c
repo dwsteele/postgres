@@ -1076,9 +1076,6 @@ readRecoverySignalFile(void)
 	 * Check for recovery signal files and if found, fsync them since they
 	 * represent server state information.  We don't sweat too much about the
 	 * possibility of fsync failure, however.
-	 *
-	 * If present, standby signal file takes precedence. If neither is present
-	 * then we won't enter archive recovery.
 	 */
 	if (stat(STANDBY_SIGNAL_FILE, &stat_buf) == 0)
 	{
@@ -1093,7 +1090,8 @@ readRecoverySignalFile(void)
 		}
 		standby_signal_file_found = true;
 	}
-	else if (stat(RECOVERY_SIGNAL_FILE, &stat_buf) == 0)
+
+	if (stat(RECOVERY_SIGNAL_FILE, &stat_buf) == 0)
 	{
 		int			fd;
 
@@ -1107,6 +1105,10 @@ readRecoverySignalFile(void)
 		recovery_signal_file_found = true;
 	}
 
+	/*
+	 * If both signal files are present, standby signal file takes precedence.
+	 * If neither is present then we won't enter archive recovery.
+	 */
 	StandbyModeRequested = false;
 	ArchiveRecoveryRequested = false;
 	if (standby_signal_file_found)
