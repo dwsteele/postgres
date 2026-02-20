@@ -5107,11 +5107,14 @@ check_recovery_target_xid(char **newval, void **extra, GucSource source)
 	{
 		TransactionId xid;
 		TransactionId *myextra;
-		uint64        xid64;
 		char          *endp;
 
 		errno = 0;
-		xid64 = strtou64(*newval, &endp, 0);
+
+		/*
+		 * This cast will remove the epoch, if any
+		 */
+		xid = (TransactionId) strtou64(*newval, &endp, 0);
 
 		if (*endp != '\0' || errno == EINVAL || errno == ERANGE)
 		{
@@ -5120,18 +5123,18 @@ check_recovery_target_xid(char **newval, void **extra, GucSource source)
 			return false;
 		}
 
-		if (xid64 < FirstNormalTransactionId || xid64 > MaxTransactionId)
+		if (xid < FirstNormalTransactionId)
 		{
-			GUC_check_errdetail("\"%s\" must be between %u and %u.",
+			GUC_check_errdetail("\"%s\" without epoch must greater than or equal to %u.",
 								"recovery_target_xid",
-								FirstNormalTransactionId, MaxTransactionId);
+								FirstNormalTransactionId);
 			return false;
 		}
 
 		myextra = (TransactionId *) guc_malloc(LOG, sizeof(TransactionId));
 		if (!myextra)
 			return false;
-		*myextra = (TransactionId) xid64;
+		*myextra = xid;
 		*extra = myextra;
 	}
 	return true;

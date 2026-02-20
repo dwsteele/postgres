@@ -77,7 +77,7 @@ $node_primary->backup('my_backup');
 $node_primary->safe_psql('postgres',
 	"INSERT INTO tab_int VALUES (generate_series(1001,2000))");
 my $ret = $node_primary->safe_psql('postgres',
-	"SELECT pg_current_wal_lsn(), pg_current_xact_id()::xid;");
+	"SELECT pg_current_wal_lsn(), pg_current_xact_id();");
 my ($lsn2, $recovery_txid) = split /\|/, $ret;
 
 # More data, with recovery target timestamp
@@ -272,22 +272,6 @@ $res = run_log(
 ok(!$res, 'invalid xid target (lower bound check)');
 
 $log_start =
-  $node_standby->wait_for_log("must be between 3 and 4294967295", $log_start);
-
-# Timeline target out of max range
-$node_standby->append_conf('postgresql.conf',
-	"recovery_target_timeline = '4294967296'");
-
-$res = run_log(
-	[
-		'pg_ctl',
-		'--pgdata' => $node_standby->data_dir,
-		'--log' => $node_standby->logfile,
-		'start',
-	]);
-ok(!$res, 'invalid xid target (upper bound check)');
-
-$log_start =
-  $node_standby->wait_for_log("must be between 3 and 4294967295", $log_start);
+  $node_standby->wait_for_log("without epoch must greater than or equal to 3", $log_start);
 
 done_testing();
