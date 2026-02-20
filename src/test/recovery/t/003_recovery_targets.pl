@@ -271,7 +271,7 @@ $res = run_log(
 	]);
 ok(!$res, 'invalid xid target (lower bound check)');
 
-$log_start =
-  $node_standby->wait_for_log("without epoch must greater than or equal to 3", $log_start);
+$log_start = $node_standby->wait_for_log(
+	"without epoch must greater than or equal to 3", $log_start);
 
 done_testing();
