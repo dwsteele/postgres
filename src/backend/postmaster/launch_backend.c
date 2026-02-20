@@ -104,7 +104,6 @@ typedef struct
 	char	  **LWLockTrancheNames;
 	int		   *LWLockCounter;
 	LWLockPadded *MainLWLockArray;
-	slock_t    *ProcStructLock;
 	PROC_HDR   *ProcGlobal;
 	PGPROC	   *AuxiliaryProcs;
 	PGPROC	   *PreparedXactProcs;
@@ -178,7 +177,7 @@ typedef struct
 } child_process_kind;
 
 static child_process_kind child_process_kinds[] = {
-#define PG_PROCTYPE(bktype, description, main_func, shmem_attach) \
+#define PG_PROCTYPE(bktype, bkcategory, description, main_func, shmem_attach) \
 	[bktype] = {description, main_func, shmem_attach},
 #include "postmaster/proctypelist.h"
 #undef PG_PROCTYPE
@@ -223,6 +222,8 @@ postmaster_child_launch(BackendType child_type, int child_slot,
 	pid = fork_process();
 	if (pid == 0)				/* child */
 	{
+		MyBackendType = child_type;
+
 		/* Capture and transfer timings that may be needed for logging */
 		if (IsExternalConnectionBackend(child_type))
 		{
@@ -607,6 +608,7 @@ SubPostmasterMain(int argc, char *argv[])
 	child_type = (BackendType) atoi(child_kind);
 	if (child_type <= B_INVALID || child_type > BACKEND_NUM_TYPES - 1)
 		elog(ERROR, "unknown child kind %s", child_kind);
+	MyBackendType = child_type;
 
 	/* Read in the variables file */
 	read_backend_variables(argv[2], &startup_data, &startup_data_len);
@@ -732,7 +734,6 @@ save_backend_variables(BackendParameters *param,
 	param->LWLockTrancheNames = LWLockTrancheNames;
 	param->LWLockCounter = LWLockCounter;
 	param->MainLWLockArray = MainLWLockArray;
-	param->ProcStructLock = ProcStructLock;
 	param->ProcGlobal = ProcGlobal;
 	param->AuxiliaryProcs = AuxiliaryProcs;
 	param->PreparedXactProcs = PreparedXactProcs;
@@ -992,7 +993,6 @@ restore_backend_variables(BackendParameters *param)
 	LWLockTrancheNames = param->LWLockTrancheNames;
 	LWLockCounter = param->LWLockCounter;
 	MainLWLockArray = param->MainLWLockArray;
-	ProcStructLock = param->ProcStructLock;
 	ProcGlobal = param->ProcGlobal;
 	AuxiliaryProcs = param->AuxiliaryProcs;
 	PreparedXactProcs = param->PreparedXactProcs;

@@ -556,8 +556,8 @@ if test "$GCC" = yes -a "$ICC" = no; then
   PGAC_PROG_CXX_CFLAGS_OPT([-Wendif-labels])
   PGAC_PROG_CC_CFLAGS_OPT([-Wmissing-format-attribute])
   PGAC_PROG_CXX_CFLAGS_OPT([-Wmissing-format-attribute])
-  PGAC_PROG_CC_CFLAGS_OPT([-Wimplicit-fallthrough=3])
-  PGAC_PROG_CXX_CFLAGS_OPT([-Wimplicit-fallthrough=3])
+  PGAC_PROG_CC_CFLAGS_OPT([-Wimplicit-fallthrough=5])
+  PGAC_PROG_CXX_CFLAGS_OPT([-Wimplicit-fallthrough=5])
   PGAC_PROG_CC_CFLAGS_OPT([-Wcast-function-type])
   PGAC_PROG_CXX_CFLAGS_OPT([-Wcast-function-type])
   PGAC_PROG_CC_CFLAGS_OPT([-Wshadow=compatible-local])
@@ -1712,7 +1712,6 @@ fi
 
 m4_defun([AC_PROG_CC_STDC], []) dnl We don't want that.
 AC_C_BIGENDIAN
-AC_C_INLINE
 PGAC_PRINTF_ARCHETYPE
 PGAC_CXX_PRINTF_ARCHETYPE
 PGAC_C_STATEMENT_EXPRESSIONS

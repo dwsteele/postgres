@@ -169,7 +169,6 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 
 	Assert(startup_data_len == 0);
 
-	MyBackendType = B_WAL_RECEIVER;
 	AuxiliaryProcessMainCommon();
 
 	/*
@@ -193,7 +192,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 		case WALRCV_STOPPING:
 			/* If we've already been requested to stop, don't start up. */
 			walrcv->walRcvState = WALRCV_STOPPED;
-			/* fall through */
+			pg_fallthrough;
 
 		case WALRCV_STOPPED:
 			SpinLockRelease(&walrcv->mutex);
