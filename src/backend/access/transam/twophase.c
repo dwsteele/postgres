@@ -447,7 +447,6 @@ MarkAsPreparingGuts(GlobalTransaction gxact, FullTransactionId fxid,
 
 	/* Initialize the PGPROC entry */
 	MemSet(proc, 0, sizeof(PGPROC));
-	dlist_node_init(&proc->links);
 	proc->waitStatus = PROC_WAIT_STATUS_OK;
 	if (LocalTransactionIdIsValid(MyProc->vxid.lxid))
 	{
@@ -474,6 +473,7 @@ MarkAsPreparingGuts(GlobalTransaction gxact, FullTransactionId fxid,
 	proc->lwWaiting = LW_WS_NOT_WAITING;
 	proc->lwWaitMode = 0;
 	proc->waitLock = NULL;
+	dlist_node_init(&proc->waitLink);
 	proc->waitProcLock = NULL;
 	pg_atomic_init_u64(&proc->waitStart, 0);
 	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
@@ -900,9 +900,10 @@ TwoPhaseGetXidByVirtualXID(VirtualTransactionId vxid,
  *		Get the dummy proc number for prepared transaction
  *
  * Dummy proc numbers are similar to proc numbers of real backends.  They
- * start at MaxBackends, and are unique across all currently active real
- * backends and prepared transactions.  If lock_held is set to true,
- * TwoPhaseStateLock will not be taken, so the caller had better hold it.
+ * start at FIRST_PREPARED_XACT_PROC_NUMBER, and are unique across all
+ * currently active real backends and prepared transactions.  If lock_held is
+ * set to true, TwoPhaseStateLock will not be taken, so the caller had better
+ * hold it.
  */
 ProcNumber
 TwoPhaseGetDummyProcNumber(FullTransactionId fxid, bool lock_held)

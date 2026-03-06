@@ -112,6 +112,7 @@
 #include "replication/walreceiver.h"
 #include "replication/worker_internal.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -1527,8 +1528,7 @@ start_table_sync(XLogRecPtr *origin_startpos, char **slotname)
 			 * idle state.
 			 */
 			AbortOutOfAnyTransaction();
-			pgstat_report_subscription_error(MySubscription->oid,
-											 WORKERTYPE_TABLESYNC);
+			pgstat_report_subscription_error(MySubscription->oid);
 
 			PG_RE_THROW();
 		}

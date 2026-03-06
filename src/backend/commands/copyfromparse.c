@@ -141,7 +141,8 @@ static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
 /* non-export function prototypes */
 static bool CopyReadLine(CopyFromState cstate, bool is_csv);
-static bool CopyReadLineText(CopyFromState cstate, bool is_csv);
+static pg_attribute_always_inline bool CopyReadLineText(CopyFromState cstate,
+														bool is_csv);
 static int	CopyReadAttributesText(CopyFromState cstate);
 static int	CopyReadAttributesCSV(CopyFromState cstate);
 static Datum CopyReadBinaryAttribute(CopyFromState cstate, FmgrInfo *flinfo,
@@ -958,6 +959,7 @@ CopyFromTextLikeOneRow(CopyFromState cstate, ExprContext *econtext,
 	int			fldct;
 	int			fieldno;
 	char	   *string;
+	bool		current_row_erroneous = false;
 
 	tupDesc = RelationGetDescr(cstate->rel);
 	attr_count = list_length(cstate->attnumlist);
@@ -1035,7 +1037,7 @@ CopyFromTextLikeOneRow(CopyFromState cstate, ExprContext *econtext,
 		}
 
 		/*
-		 * If ON_ERROR is specified with IGNORE, skip rows with soft errors
+		 * If ON_ERROR is specified, handle the different options
 		 */
 		else if (!InputFunctionCallSafe(&in_functions[m],
 										string,
@@ -1046,7 +1048,55 @@ CopyFromTextLikeOneRow(CopyFromState cstate, ExprContext *econtext,
 		{
 			Assert(cstate->opts.on_error != COPY_ON_ERROR_STOP);
 
-			cstate->num_errors++;
+			if (cstate->opts.on_error == COPY_ON_ERROR_IGNORE)
+				cstate->num_errors++;
+			else if (cstate->opts.on_error == COPY_ON_ERROR_SET_NULL)
+			{
+				/*
+				 * Reset error state so the subsequent InputFunctionCallSafe
+				 * call (for domain constraint check) can properly report
+				 * whether it succeeded or failed.
+				 */
+				cstate->escontext->error_occurred = false;
+
+				Assert(cstate->domain_with_constraint != NULL);
+
+				/*
+				 * For constrained domains, we need an additional
+				 * InputFunctionCallSafe() to ensure that an error is thrown
+				 * if the domain constraint rejects null values.
+				 */
+				if (!cstate->domain_with_constraint[m] ||
+					InputFunctionCallSafe(&in_functions[m],
+										  NULL,
+										  typioparams[m],
+										  att->atttypmod,
+										  (Node *) cstate->escontext,
+										  &values[m]))
+				{
+					nulls[m] = true;
+					values[m] = (Datum) 0;
+				}
+				else
+					ereport(ERROR,
+							errcode(ERRCODE_NOT_NULL_VIOLATION),
+							errmsg("domain %s does not allow null values",
+								   format_type_be(typioparams[m])),
+							errdetail("ON_ERROR SET_NULL cannot be applied because column \"%s\" (domain %s) does not accept null values.",
+									  cstate->cur_attname,
+									  format_type_be(typioparams[m])),
+							errdatatype(typioparams[m]));
+
+				/*
+				 * We count only the number of rows (not fields) where
+				 * ON_ERROR SET_NULL was applied.
+				 */
+				if (!current_row_erroneous)
+				{
+					current_row_erroneous = true;
+					cstate->num_errors++;
+				}
+			}
 
 			if (cstate->opts.log_verbosity == COPY_LOG_VERBOSITY_VERBOSE)
 			{
@@ -1063,24 +1113,37 @@ CopyFromTextLikeOneRow(CopyFromState cstate, ExprContext *econtext,
 					char	   *attval;
 
 					attval = CopyLimitPrintoutLength(cstate->cur_attval);
-					ereport(NOTICE,
-							errmsg("skipping row due to data type incompatibility at line %" PRIu64 " for column \"%s\": \"%s\"",
-								   cstate->cur_lineno,
-								   cstate->cur_attname,
-								   attval));
+
+					if (cstate->opts.on_error == COPY_ON_ERROR_IGNORE)
+						ereport(NOTICE,
+								errmsg("skipping row due to data type incompatibility at line %" PRIu64 " for column \"%s\": \"%s\"",
+									   cstate->cur_lineno,
+									   cstate->cur_attname,
+									   attval));
+					else if (cstate->opts.on_error == COPY_ON_ERROR_SET_NULL)
+						ereport(NOTICE,
+								errmsg("setting to null due to data type incompatibility at line %" PRIu64 " for column \"%s\": \"%s\"",
+									   cstate->cur_lineno,
+									   cstate->cur_attname,
+									   attval));
 					pfree(attval);
 				}
 				else
-					ereport(NOTICE,
-							errmsg("skipping row due to data type incompatibility at line %" PRIu64 " for column \"%s\": null input",
-								   cstate->cur_lineno,
-								   cstate->cur_attname));
-
+				{
+					if (cstate->opts.on_error == COPY_ON_ERROR_IGNORE)
+						ereport(NOTICE,
+								errmsg("skipping row due to data type incompatibility at line %" PRIu64 " for column \"%s\": null input",
+									   cstate->cur_lineno,
+									   cstate->cur_attname));
+				}
 				/* reset relname_only */
 				cstate->relname_only = false;
 			}
 
-			return true;
+			if (cstate->opts.on_error == COPY_ON_ERROR_IGNORE)
+				return true;
+			else if (cstate->opts.on_error == COPY_ON_ERROR_SET_NULL)
+				continue;
 		}
 
 		cstate->cur_attname = NULL;
@@ -1173,8 +1236,17 @@ CopyReadLine(CopyFromState cstate, bool is_csv)
 	resetStringInfo(&cstate->line_buf);
 	cstate->line_buf_valid = false;
 
-	/* Parse data and transfer into line_buf */
-	result = CopyReadLineText(cstate, is_csv);
+	/*
+	 * Parse data and transfer into line_buf.
+	 *
+	 * Because this is performance critical, we inline CopyReadLineText() and
+	 * pass the boolean parameters as constants to allow the compiler to emit
+	 * specialized code with fewer branches.
+	 */
+	if (is_csv)
+		result = CopyReadLineText(cstate, true);
+	else
+		result = CopyReadLineText(cstate, false);
 
 	if (result)
 	{
@@ -1241,7 +1313,7 @@ CopyReadLine(CopyFromState cstate, bool is_csv)
 /*
  * CopyReadLineText - inner loop of CopyReadLine for text mode
  */
-static bool
+static pg_attribute_always_inline bool
 CopyReadLineText(CopyFromState cstate, bool is_csv)
 {
 	char	   *copy_input_buf;

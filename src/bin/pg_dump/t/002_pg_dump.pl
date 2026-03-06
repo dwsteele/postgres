@@ -1070,6 +1070,43 @@ my %tests = (
 		},
 	},
 
+	'CONSTRAINT NOT NULL / NO INHERIT' => {
+		create_sql => 'CREATE TABLE dump_test.test_table_nonn (
+		col1 int NOT NULL NO INHERIT,
+		col2 int);
+		CREATE TABLE dump_test.test_table_nonn_chld1 (
+		   CONSTRAINT nn NOT NULL col2 NO INHERIT)
+		INHERITS (dump_test.test_table_nonn); ',
+		regexp => qr/^
+			\QCREATE TABLE dump_test.test_table_nonn (\E \n^\s+
+			\Qcol1 integer NOT NULL NO INHERIT\E
+			/xm,
+		like => {
+			%full_runs, %dump_test_schema_runs,
+			section_pre_data => 1,
+			binary_upgrade => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
+	'CONSTRAINT NOT NULL / NO INHERIT (child1)' => {
+		regexp => qr/^
+			\QCREATE TABLE dump_test.test_table_nonn_chld1 (\E \n^\s+
+			\QCONSTRAINT nn NOT NULL col2 NO INHERIT\E
+			/xm,
+		like => {
+			%full_runs, %dump_test_schema_runs, section_pre_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+			binary_upgrade => 1,
+		},
+	},
+
 	'CONSTRAINT PRIMARY KEY / WITHOUT OVERLAPS' => {
 		create_sql => 'CREATE TABLE dump_test.test_table_tpk (
 							col1 int4range,
@@ -2048,13 +2085,8 @@ my %tests = (
 		},
 	},
 
-	'newline of role or table name in comment' => {
-		create_sql => qq{CREATE ROLE regress_newline;
-						 ALTER ROLE regress_newline SET enable_seqscan = off;
-						 ALTER ROLE regress_newline
-							RENAME TO "regress_newline\nattack";
-
-						 -- meet getPartitioningInfo() "unsafe" condition
+	'newline of table name in comment' => {
+		create_sql => qq{-- meet getPartitioningInfo() "unsafe" condition
 						 CREATE TYPE pp_colors AS
 							ENUM ('green', 'blue', 'black');
 						 CREATE TABLE pp_enumpart (a pp_colors)
@@ -3166,6 +3198,36 @@ my %tests = (
 						 WITH (publish = \'\');',
 		regexp => qr/^
 			\QCREATE PUBLICATION pub7 FOR ALL TABLES, ALL SEQUENCES WITH (publish = '');\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+	},
+
+	'CREATE PUBLICATION pub8' => {
+		create_order => 50,
+		create_sql =>
+		  'CREATE PUBLICATION pub8 FOR ALL TABLES EXCEPT TABLE (dump_test.test_table);',
+		regexp => qr/^
+			\QCREATE PUBLICATION pub8 FOR ALL TABLES EXCEPT TABLE (ONLY dump_test.test_table) WITH (publish = 'insert, update, delete, truncate');\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+	},
+
+	'CREATE PUBLICATION pub9' => {
+		create_order => 50,
+		create_sql =>
+		  'CREATE PUBLICATION pub9 FOR ALL TABLES EXCEPT TABLE (dump_test.test_table, dump_test.test_second_table);',
+		regexp => qr/^
+			\QCREATE PUBLICATION pub9 FOR ALL TABLES EXCEPT TABLE (ONLY dump_test.test_table, ONLY dump_test.test_second_table) WITH (publish = 'insert, update, delete, truncate');\E
+			/xm,
+		like => { %full_runs, section_post_data => 1, },
+	},
+
+	'CREATE PUBLICATION pub10' => {
+		create_order => 92,
+		create_sql =>
+		  'CREATE PUBLICATION pub10 FOR ALL TABLES EXCEPT TABLE (dump_test.test_inheritance_parent);',
+		regexp => qr/^
+			\QCREATE PUBLICATION pub10 FOR ALL TABLES EXCEPT TABLE (ONLY dump_test.test_inheritance_parent, ONLY dump_test.test_inheritance_child) WITH (publish = 'insert, update, delete, truncate');\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},

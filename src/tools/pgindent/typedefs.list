@@ -600,6 +600,7 @@ CustomScanMethods
 CustomScanState
 CycleCtr
 DBState
+DbOidName
 DCHCacheEntry
 DEADLOCK_INFO
 DECountItem
@@ -3394,6 +3395,7 @@ X509_NAME
 X509_NAME_ENTRY
 X509_STORE
 X509_STORE_CTX
+X86FeatureId
 XLTW_Oper
 XLogCtlData
 XLogCtlInsert

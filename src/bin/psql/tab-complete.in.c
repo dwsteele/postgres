@@ -2536,12 +2536,24 @@ match_previous_words(int pattern_id,
 	else if (Matches("ALTER", "USER|ROLE", MatchAny) &&
 			 !TailMatches("USER", "MAPPING"))
 		COMPLETE_WITH("BYPASSRLS", "CONNECTION LIMIT", "CREATEDB", "CREATEROLE",
-					  "ENCRYPTED PASSWORD", "INHERIT", "LOGIN", "NOBYPASSRLS",
+					  "ENCRYPTED PASSWORD", "IN", "INHERIT", "LOGIN", "NOBYPASSRLS",
 					  "NOCREATEDB", "NOCREATEROLE", "NOINHERIT",
 					  "NOLOGIN", "NOREPLICATION", "NOSUPERUSER", "PASSWORD",
 					  "RENAME TO", "REPLICATION", "RESET", "SET", "SUPERUSER",
 					  "VALID UNTIL", "WITH");
-
+	/* ALTER USER,ROLE <name> IN */
+	else if (Matches("ALTER", "USER|ROLE", MatchAny, "IN"))
+		COMPLETE_WITH("DATABASE");
+	/* ALTER USER,ROLE <name> IN DATABASE */
+	else if (Matches("ALTER", "USER|ROLE", MatchAny, "IN", "DATABASE"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_databases);
+	/* ALTER USER,ROLE <name> IN DATABASE <dbname> */
+	else if (Matches("ALTER", "USER|ROLE", MatchAny, "IN", "DATABASE", MatchAny))
+		COMPLETE_WITH("SET", "RESET");
+	/* ALTER USER,ROLE <name> IN DATABASE <dbname> SET */
+	else if (Matches("ALTER", "USER|ROLE", MatchAny, "IN", "DATABASE", MatchAny, "SET"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_set_vars);
+	/* XXX missing support for ALTER ROLE <name> IN DATABASE <dbname> RESET */
 	/* ALTER USER,ROLE <name> RESET */
 	else if (Matches("ALTER", "USER|ROLE", MatchAny, "RESET"))
 	{
@@ -3425,7 +3437,7 @@ match_previous_words(int pattern_id,
 
 			/* Complete COPY <sth> FROM filename WITH (ON_ERROR */
 			else if (TailMatches("ON_ERROR"))
-				COMPLETE_WITH("stop", "ignore");
+				COMPLETE_WITH("stop", "ignore", "set_null");
 
 			/* Complete COPY <sth> FROM filename WITH (LOG_VERBOSITY */
 			else if (TailMatches("LOG_VERBOSITY"))
@@ -3669,7 +3681,17 @@ match_previous_words(int pattern_id,
 	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL"))
 		COMPLETE_WITH("TABLES", "SEQUENCES");
 	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL", "TABLES"))
-		COMPLETE_WITH("WITH (");
+		COMPLETE_WITH("EXCEPT TABLE (", "WITH (");
+	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL", "TABLES", "EXCEPT"))
+		COMPLETE_WITH("TABLE (");
+	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL", "TABLES", "EXCEPT", "TABLE"))
+		COMPLETE_WITH("(");
+	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL", "TABLES", "EXCEPT", "TABLE", "("))
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables);
+	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL", "TABLES", "EXCEPT", "TABLE", "(", MatchAnyN) && ends_with(prev_wd, ','))
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables);
+	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "ALL", "TABLES", "EXCEPT", "TABLE", "(", MatchAnyN) && !ends_with(prev_wd, ','))
+		COMPLETE_WITH(")");
 	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "TABLES"))
 		COMPLETE_WITH("IN SCHEMA");
 	else if (Matches("CREATE", "PUBLICATION", MatchAny, "FOR", "TABLE", MatchAny) && !ends_with(prev_wd, ','))
@@ -4266,7 +4288,9 @@ match_previous_words(int pattern_id,
 	/* Complete DELETE FROM <table> */
 	else if (TailMatches("DELETE", "FROM", MatchAny))
 		COMPLETE_WITH("USING", "WHERE");
-	/* XXX: implement tab completion for DELETE ... USING */
+	/* Complete DELETE FROM <table> USING with relations supporting SELECT */
+	else if (TailMatches("DELETE", "FROM", MatchAny, "USING"))
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_selectables);
 
 /* DISCARD */
 	else if (Matches("DISCARD"))
@@ -6324,8 +6348,7 @@ append_variable_names(char ***varnames, int *nvars,
 	if (*nvars >= *maxvars)
 	{
 		*maxvars *= 2;
-		*varnames = (char **) pg_realloc(*varnames,
-										 ((*maxvars) + 1) * sizeof(char *));
+		*varnames = pg_realloc_array(*varnames, char *, (*maxvars) + 1);
 	}
 
 	(*varnames)[(*nvars)++] = psprintf("%s%s%s", prefix, varname, suffix);
@@ -6350,7 +6373,7 @@ complete_from_variables(const char *text, const char *prefix, const char *suffix
 	int			i;
 	struct _variable *ptr;
 
-	varnames = (char **) pg_malloc((maxvars + 1) * sizeof(char *));
+	varnames = pg_malloc_array(char *, maxvars + 1);
 
 	for (ptr = pset.vars->next; ptr; ptr = ptr->next)
 	{
@@ -6928,7 +6951,7 @@ get_previous_words(int point, char **buffer, int *nwords)
 	 * This is usually much more space than we need, but it's cheaper than
 	 * doing a separate malloc() for each word.
 	 */
-	previous_words = (char **) pg_malloc(point * sizeof(char *));
+	previous_words = pg_malloc_array(char *, point);
 	*buffer = outptr = (char *) pg_malloc(point * 2);
 
 	/*
