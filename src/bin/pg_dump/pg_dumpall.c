@@ -34,6 +34,7 @@
 #include "common/string.h"
 #include "connectdb.h"
 #include "dumputils.h"
+#include "fe_utils/option_utils.h"
 #include "fe_utils/string_utils.h"
 #include "filter.h"
 #include "getopt_long.h"
@@ -219,6 +220,7 @@ main(int argc, char *argv[])
 	bool		data_only = false;
 	bool		globals_only = false;
 	bool		roles_only = false;
+	bool		schema_only = false;
 	bool		tablespaces_only = false;
 	PGconn	   *conn;
 	int			encoding;
@@ -321,6 +323,7 @@ main(int argc, char *argv[])
 				break;
 
 			case 's':
+				schema_only = true;
 				appendPQExpBufferStr(pgdumpopts, " -s");
 				break;
 
@@ -418,44 +421,47 @@ main(int argc, char *argv[])
 		exit_nicely(1);
 	}
 
-	if (database_exclude_patterns.head != NULL &&
-		(globals_only || roles_only || tablespaces_only))
-	{
-		pg_log_error("option %s cannot be used together with %s, %s, or %s",
-					 "--exclude-database",
-					 "-g/--globals-only", "-r/--roles-only", "-t/--tablespaces-only");
-		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
-		exit_nicely(1);
-	}
+	/* --exclude-database is incompatible with global *-only options */
+	check_mut_excl_opts(database_exclude_patterns.head, "--exclude-database",
+						globals_only, "-g/--globals-only",
+						roles_only, "-r/--roles-only",
+						tablespaces_only, "-t/--tablespaces-only");
 
-	/* Make sure the user hasn't specified a mix of globals-only options */
-	if (globals_only && roles_only)
-	{
-		pg_log_error("options %s and %s cannot be used together",
-					 "-g/--globals-only", "-r/--roles-only");
-		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
-		exit_nicely(1);
-	}
+	/* *-only options are incompatible with each other */
+	check_mut_excl_opts(data_only, "-a/--data-only",
+						globals_only, "-g/--globals-only",
+						roles_only, "-r/--roles-only",
+						schema_only, "-s/--schema-only",
+						statistics_only, "--statistics-only",
+						tablespaces_only, "-t/--tablespaces-only");
 
-	if (globals_only && tablespaces_only)
-	{
-		pg_log_error("options %s and %s cannot be used together",
-					 "-g/--globals-only", "-t/--tablespaces-only");
-		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
-		exit_nicely(1);
-	}
+	/* --no-* and *-only for same thing are incompatible */
+	check_mut_excl_opts(data_only, "-a/--data-only",
+						no_data, "--no-data");
+	check_mut_excl_opts(schema_only, "-s/--schema-only",
+						no_schema, "--no-schema");
+	check_mut_excl_opts(statistics_only, "--statistics-only",
+						no_statistics, "--no-statistics");
+
+	/* --statistics and --no-statistics are incompatible */
+	check_mut_excl_opts(with_statistics, "--statistics",
+						no_statistics, "--no-statistics");
+
+	/* --statistics is incompatible with *-only (except --statistics-only) */
+	check_mut_excl_opts(with_statistics, "--statistics",
+						data_only, "-a/--data-only",
+						globals_only, "-g/--globals-only",
+						roles_only, "-r/--roles-only",
+						schema_only, "-s/--schema-only",
+						tablespaces_only, "-t/--tablespaces-only");
+
+	/* --clean and --data-only are incompatible */
+	check_mut_excl_opts(output_clean, "-c/--clean",
+						data_only, "-a/--data-only");
 
 	if (if_exists && !output_clean)
 		pg_fatal("option %s requires option %s",
 				 "--if-exists", "-c/--clean");
-
-	if (roles_only && tablespaces_only)
-	{
-		pg_log_error("options %s and %s cannot be used together",
-					 "-r/--roles-only", "-t/--tablespaces-only");
-		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
-		exit_nicely(1);
-	}
 
 	/* Get format for dump. */
 	archDumpFormat = parseDumpFormat(format_name);
@@ -1831,7 +1837,6 @@ dropDBs(PGconn *conn)
 	for (i = 0; i < PQntuples(res); i++)
 	{
 		char	   *dbname = PQgetvalue(res, i, 0);
-		PQExpBuffer delQry = createPQExpBuffer();
 
 		/*
 		 * Skip "postgres" and "template1"; dumpDatabases() will deal with
@@ -1844,15 +1849,14 @@ dropDBs(PGconn *conn)
 		{
 			if (archDumpFormat == archNull)
 			{
-				appendPQExpBuffer(delQry, "DROP DATABASE %s%s;\n",
-								  if_exists ? "IF EXISTS " : "",
-								  fmtId(dbname));
-				fprintf(OPF, "%s", delQry->data);
+				fprintf(OPF, "DROP DATABASE %s%s;\n",
+						if_exists ? "IF EXISTS " : "",
+						fmtId(dbname));
 			}
 			else
 			{
-				appendPQExpBuffer(delQry, "DROP DATABASE IF EXISTS %s;\n",
-								  fmtId(dbname));
+				char	   *stmt = psprintf("DROP DATABASE IF EXISTS %s;\n",
+											fmtId(dbname));
 
 				ArchiveEntry(fout,
 							 nilCatalogId,	/* catalog ID */
@@ -1860,10 +1864,9 @@ dropDBs(PGconn *conn)
 							 ARCHIVE_OPTS(.tag = psprintf("DATABASE %s", fmtId(dbname)),
 										  .description = "DROP_GLOBAL",
 										  .section = SECTION_PRE_DATA,
-										  .createStmt = delQry->data));
+										  .createStmt = stmt));
+				pg_free(stmt);
 			}
-
-			destroyPQExpBuffer(delQry);
 		}
 	}
 

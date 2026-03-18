@@ -106,6 +106,7 @@
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 /*
  * Directory where Two-phase commit files reside within PGDATA
@@ -744,6 +745,7 @@ pg_prepared_xact(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "dbid",
 						   OIDOID, -1, 0);
 
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		/*

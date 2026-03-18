@@ -549,10 +549,10 @@ if test "$GCC" = yes -a "$ICC" = no; then
   AC_SUBST(PERMIT_DECLARATION_AFTER_STATEMENT)
   # Really don't want VLAs to be used in our dialect of C
   PGAC_PROG_CC_CFLAGS_OPT([-Werror=vla])
+  # -Wvla is not applicable for C++
   # On macOS, complain about usage of symbols newer than the deployment target
   PGAC_PROG_CC_CFLAGS_OPT([-Werror=unguarded-availability-new])
   PGAC_PROG_CXX_CFLAGS_OPT([-Werror=unguarded-availability-new])
-  # -Wvla is not applicable for C++
   PGAC_PROG_CC_CFLAGS_OPT([-Wendif-labels])
   PGAC_PROG_CXX_CFLAGS_OPT([-Wendif-labels])
   PGAC_PROG_CC_CFLAGS_OPT([-Wmissing-format-attribute])
@@ -785,13 +785,6 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([], [return 0;])],
   [AC_MSG_RESULT(yes)],
   [AC_MSG_RESULT(no)
    AC_MSG_ERROR([cannot proceed])])
-
-# Defend against gcc -ffast-math
-if test "$GCC" = yes; then
-AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [@%:@ifdef __FAST_MATH__
-choke me
-@%:@endif])], [], [AC_MSG_ERROR([do not put -ffast-math in CFLAGS])])
-fi
 
 # Defend against clang being used on x86-32 without SSE2 enabled.  As current
 # versions of clang do not understand -fexcess-precision=standard, the use of
@@ -1730,9 +1723,10 @@ m4_defun([AC_PROG_CC_STDC], []) dnl We don't want that.
 AC_C_BIGENDIAN
 PGAC_PRINTF_ARCHETYPE
 PGAC_CXX_PRINTF_ARCHETYPE
-PGAC_C_STATEMENT_EXPRESSIONS
 PGAC_C_TYPEOF
 PGAC_CXX_TYPEOF
+PGAC_C_TYPEOF_UNQUAL
+PGAC_CXX_TYPEOF_UNQUAL
 PGAC_C_TYPES_COMPATIBLE
 PGAC_C_BUILTIN_CONSTANT_P
 PGAC_C_BUILTIN_OP_OVERFLOW

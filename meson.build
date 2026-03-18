@@ -324,6 +324,7 @@ elif host_system == 'openbsd'
 
 elif host_system == 'sunos'
   portname = 'solaris'
+  sema_kind = 'unnamed_posix'
   export_fmt = '-Wl,-M@0@'
   # We need these #defines to get POSIX-conforming versions
   # of many interfaces (sigwait, getpwuid_r, shmdt, ...).
@@ -1990,19 +1991,6 @@ if cc.compiles('''
 endif
 
 
-# Check if the C compiler supports GCC-style statement expressions.
-if cc.compiles('''
-    int main(int arg, char **argv)
-    {
-        ({ _Static_assert(1, "foo"); });
-    }
-    ''',
-    name: 'statement expressions',
-    args: test_c_args)
-  cdata.set('HAVE_STATEMENT_EXPRESSIONS', 1)
-endif
-
-
 # Select the format archetype to be used to check printf-type functions.
 #
 # Need to check a call with %m because netbsd supports gnu_printf but emits a
@@ -2971,6 +2959,64 @@ int main(void)
       cdata.set('HAVE_CXX_TYPEOF', 1)
       if kw != 'typeof'
         cdata.set('pg_cxx_typeof', kw)
+      endif
+
+      break
+    endif
+  endforeach
+endif
+
+# Check if the C compiler understands typeof_unqual or a variant.  Define
+# HAVE_TYPEOF_UNQUAL if so, and define 'typeof_unqual' to the actual key word.
+#
+# Test with a void pointer, because MSVC doesn't handle that, and we
+# need that for copyObject().
+foreach kw : ['typeof_unqual', '__typeof_unqual__']
+  if cc.compiles('''
+int main(void)
+{
+    int x = 0;
+    @0@(x) y;
+    const void *a;
+    void *b;
+    y = x;
+    b = (@0@(*a) *) a;
+    return y;
+}
+'''.format(kw),
+    name: kw,
+    args: test_c_args, include_directories: postgres_inc)
+
+    cdata.set('HAVE_TYPEOF_UNQUAL', 1)
+    if kw != 'typeof_unqual'
+      cdata.set('typeof_unqual', kw)
+    endif
+
+    break
+  endif
+endforeach
+
+# Check if the C++ compiler understands typeof_unqual or a variant.
+if have_cxx
+  foreach kw : ['typeof_unqual', '__typeof_unqual__']
+    if cxx.compiles('''
+int main(void)
+{
+    int x = 0;
+    @0@(x) y;
+    const void *a;
+    void *b;
+    y = x;
+    b = (@0@(*a) *) a;
+    return y;
+}
+'''.format(kw),
+      name: 'C++ ' + kw,
+      args: test_c_args, include_directories: postgres_inc)
+
+      cdata.set('HAVE_CXX_TYPEOF_UNQUAL', 1)
+      if kw != 'typeof_unqual'
+        cdata.set('pg_cxx_typeof_unqual', kw)
       endif
 
       break

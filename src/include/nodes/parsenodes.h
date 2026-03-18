@@ -711,6 +711,19 @@ typedef struct RangeTableFuncCol
 } RangeTableFuncCol;
 
 /*
+ * RangeGraphTable - raw form of GRAPH_TABLE clause
+ */
+typedef struct RangeGraphTable
+{
+	NodeTag		type;
+	RangeVar   *graph_name;
+	struct GraphPattern *graph_pattern;
+	List	   *columns;
+	Alias	   *alias;			/* table alias & optional column aliases */
+	ParseLoc	location;		/* token location, or -1 if unknown */
+} RangeGraphTable;
+
+/*
  * RangeTableSample - TABLESAMPLE appearing in a raw FROM clause
  *
  * This node, appearing only in raw parse trees, represents
@@ -1003,6 +1016,42 @@ typedef struct PartitionCmd
 	bool		concurrent;
 } PartitionCmd;
 
+/*
+ * Nodes for graph pattern
+ */
+
+typedef struct GraphPattern
+{
+	NodeTag		type;
+	List	   *path_pattern_list;
+	Node	   *whereClause;
+} GraphPattern;
+
+typedef enum GraphElementPatternKind
+{
+	VERTEX_PATTERN,
+	EDGE_PATTERN_LEFT,
+	EDGE_PATTERN_RIGHT,
+	EDGE_PATTERN_ANY,
+	PAREN_EXPR,
+} GraphElementPatternKind;
+
+#define IS_EDGE_PATTERN(kind) ((kind) == EDGE_PATTERN_ANY || \
+							   (kind) == EDGE_PATTERN_RIGHT || \
+							   (kind) == EDGE_PATTERN_LEFT)
+
+typedef struct GraphElementPattern
+{
+	NodeTag		type;
+	GraphElementPatternKind kind;
+	const char *variable;
+	Node	   *labelexpr;
+	List	   *subexpr;
+	Node	   *whereClause;
+	List	   *quantifier;
+	ParseLoc	location;
+} GraphElementPattern;
+
 /****************************************************************************
  *	Nodes for a Query tree
  ****************************************************************************/
@@ -1075,6 +1124,7 @@ typedef enum RTEKind
 	RTE_VALUES,					/* VALUES (<exprlist>), (<exprlist>), ... */
 	RTE_CTE,					/* common table expr (WITH list element) */
 	RTE_NAMEDTUPLESTORE,		/* tuplestore, e.g. for AFTER triggers */
+	RTE_GRAPH_TABLE,			/* GRAPH_TABLE clause */
 	RTE_RESULT,					/* RTE represents an empty FROM clause; such
 								 * RTEs are added by the planner, they're not
 								 * present during parsing or rewriting */
@@ -1240,6 +1290,12 @@ typedef struct RangeTblEntry
 	 * Fields valid for a TableFunc RTE (else NULL):
 	 */
 	TableFunc  *tablefunc;
+
+	/*
+	 * Fields valid for a graph table RTE (else NULL):
+	 */
+	GraphPattern *graph_pattern;
+	List	   *graph_table_columns;
 
 	/*
 	 * Fields valid for a values RTE (else NIL):
@@ -2381,6 +2437,7 @@ typedef enum ObjectType
 	OBJECT_PARAMETER_ACL,
 	OBJECT_POLICY,
 	OBJECT_PROCEDURE,
+	OBJECT_PROPGRAPH,
 	OBJECT_PUBLICATION,
 	OBJECT_PUBLICATION_NAMESPACE,
 	OBJECT_PUBLICATION_REL,
@@ -3983,18 +4040,6 @@ typedef struct AlterSystemStmt
 } AlterSystemStmt;
 
 /* ----------------------
- *		Cluster Statement (support pbrown's cluster index implementation)
- * ----------------------
- */
-typedef struct ClusterStmt
-{
-	NodeTag		type;
-	RangeVar   *relation;		/* relation being indexed, or NULL if all */
-	char	   *indexname;		/* original index defined */
-	List	   *params;			/* list of DefElem nodes */
-} ClusterStmt;
-
-/* ----------------------
  *		Vacuum and Analyze Statements
  *
  * Even though these are nominally two statements, it's convenient to use
@@ -4006,7 +4051,7 @@ typedef struct VacuumStmt
 	NodeTag		type;
 	List	   *options;		/* list of DefElem nodes */
 	List	   *rels;			/* list of VacuumRelation, or NIL for all */
-	bool		is_vacuumcmd;	/* true for VACUUM, false for ANALYZE */
+	bool		is_vacuumcmd;	/* true for VACUUM, false otherwise */
 } VacuumStmt;
 
 /*
@@ -4023,6 +4068,27 @@ typedef struct VacuumRelation
 	Oid			oid;			/* table's OID; InvalidOid if not looked up */
 	List	   *va_cols;		/* list of column names, or NIL for all */
 } VacuumRelation;
+
+/* ----------------------
+ *		Repack Statement
+ * ----------------------
+ */
+typedef enum RepackCommand
+{
+	REPACK_COMMAND_CLUSTER = 1,
+	REPACK_COMMAND_REPACK,
+	REPACK_COMMAND_VACUUMFULL,
+} RepackCommand;
+
+typedef struct RepackStmt
+{
+	NodeTag		type;
+	RepackCommand command;		/* type of command being run */
+	VacuumRelation *relation;	/* relation being repacked */
+	char	   *indexname;		/* order tuples by this index */
+	bool		usingindex;		/* whether USING INDEX is specified */
+	List	   *params;			/* list of DefElem nodes */
+} RepackStmt;
 
 /* ----------------------
  *		Explain Statement
@@ -4176,6 +4242,88 @@ typedef struct CreateCastStmt
 	CoercionContext context;
 	bool		inout;
 } CreateCastStmt;
+
+/* ----------------------
+ *	CREATE PROPERTY GRAPH Statement
+ * ----------------------
+ */
+typedef struct CreatePropGraphStmt
+{
+	NodeTag		type;
+	RangeVar   *pgname;
+	List	   *vertex_tables;
+	List	   *edge_tables;
+} CreatePropGraphStmt;
+
+typedef struct PropGraphVertex
+{
+	NodeTag		type;
+	RangeVar   *vtable;
+	List	   *vkey;
+	List	   *labels;
+	ParseLoc	location;
+} PropGraphVertex;
+
+typedef struct PropGraphEdge
+{
+	NodeTag		type;
+	RangeVar   *etable;
+	List	   *ekey;
+	List	   *esrckey;
+	char	   *esrcvertex;
+	List	   *esrcvertexcols;
+	List	   *edestkey;
+	char	   *edestvertex;
+	List	   *edestvertexcols;
+	List	   *labels;
+	ParseLoc	location;
+} PropGraphEdge;
+
+typedef struct PropGraphLabelAndProperties
+{
+	NodeTag		type;
+	const char *label;
+	struct PropGraphProperties *properties;
+	ParseLoc	location;
+} PropGraphLabelAndProperties;
+
+typedef struct PropGraphProperties
+{
+	NodeTag		type;
+	List	   *properties;
+	bool		all;
+	ParseLoc	location;
+} PropGraphProperties;
+
+/* ----------------------
+ *	ALTER PROPERTY GRAPH Statement
+ * ----------------------
+ */
+
+typedef enum AlterPropGraphElementKind
+{
+	PROPGRAPH_ELEMENT_KIND_VERTEX = 1,
+	PROPGRAPH_ELEMENT_KIND_EDGE = 2,
+} AlterPropGraphElementKind;
+
+typedef struct AlterPropGraphStmt
+{
+	NodeTag		type;
+	RangeVar   *pgname;
+	bool		missing_ok;
+	List	   *add_vertex_tables;
+	List	   *add_edge_tables;
+	List	   *drop_vertex_tables;
+	List	   *drop_edge_tables;
+	DropBehavior drop_behavior;
+	AlterPropGraphElementKind element_kind;
+	const char *element_alias;
+	List	   *add_labels;
+	const char *drop_label;
+	const char *alter_label;
+	PropGraphProperties *add_properties;
+	List	   *drop_properties;
+} AlterPropGraphStmt;
 
 /* ----------------------
  *	CREATE TRANSFORM Statement
@@ -4383,6 +4531,7 @@ typedef struct CreateSubscriptionStmt
 {
 	NodeTag		type;
 	char	   *subname;		/* Name of the subscription */
+	char	   *servername;		/* Server name of publisher */
 	char	   *conninfo;		/* Connection string to publisher */
 	List	   *publication;	/* One or more publication to subscribe to */
 	List	   *options;		/* List of DefElem nodes */
@@ -4391,6 +4540,7 @@ typedef struct CreateSubscriptionStmt
 typedef enum AlterSubscriptionType
 {
 	ALTER_SUBSCRIPTION_OPTIONS,
+	ALTER_SUBSCRIPTION_SERVER,
 	ALTER_SUBSCRIPTION_CONNECTION,
 	ALTER_SUBSCRIPTION_SET_PUBLICATION,
 	ALTER_SUBSCRIPTION_ADD_PUBLICATION,
@@ -4406,6 +4556,7 @@ typedef struct AlterSubscriptionStmt
 	NodeTag		type;
 	AlterSubscriptionType kind; /* ALTER_SUBSCRIPTION_OPTIONS, etc */
 	char	   *subname;		/* Name of the subscription */
+	char	   *servername;		/* Server name of publisher */
 	char	   *conninfo;		/* Connection string to publisher */
 	List	   *publication;	/* One or more publication to subscribe to */
 	List	   *options;		/* List of DefElem nodes */
