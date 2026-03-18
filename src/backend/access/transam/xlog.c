@@ -9601,11 +9601,24 @@ backup_control_file(uint8_t *controlFile)
 {
 	ControlFileData *controlData = ((ControlFileData *)controlFile);
 
-	memset(controlFile + sizeof(ControlFileData), 0,
-		   PG_CONTROL_FILE_SIZE - sizeof(ControlFileData));
+	memset(controlFile, 0, PG_CONTROL_FILE_SIZE);
 
 	LWLockAcquire(ControlFileLock, LW_SHARED);
 	memcpy(controlFile, ControlFile, sizeof(ControlFileData));
+
+#ifdef USE_ASSERT_CHECKING
+	/*
+	 * Verify that the contents of pg_control are the same in memory as on disk
+	 */
+	{
+		bool crc_ok;
+		ControlFileData *dataDisk = get_controlfile(DataDir, &crc_ok);
+
+		Assert(crc_ok &&
+			   memcmp(dataDisk, controlFile, sizeof(ControlFileData)) == 0);
+	}
+#endif
+
 	LWLockRelease(ControlFileLock);
 
 	controlData->backupLabelRequired = true;
