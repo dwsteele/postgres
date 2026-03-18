@@ -322,7 +322,6 @@ my %pgdump_runs = (
 			'--file' => "$tempdir/pg_dumpall_globals.sql",
 			'--globals-only',
 			'--no-sync',
-			'--statistics',
 		],
 	},
 	pg_dumpall_globals_clean => {
@@ -332,7 +331,6 @@ my %pgdump_runs = (
 			'--globals-only',
 			'--clean',
 			'--no-sync',
-			'--statistics',
 		],
 	},
 	pg_dumpall_dbprivs => {
@@ -3133,6 +3131,18 @@ my %tests = (
 		},
 	},
 
+	'CREATE PROPERTY GRAPH propgraph' => {
+		create_order => 20,
+		create_sql => 'CREATE PROPERTY GRAPH dump_test.propgraph;',
+		regexp => qr/^
+			\QCREATE PROPERTY GRAPH dump_test.propgraph\E;
+			/xm,
+		like =>
+		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
+		unlike =>
+		  { exclude_dump_test_schema => 1, only_dump_measurement => 1, },
+	},
+
 	'CREATE PUBLICATION pub1' => {
 		create_order => 50,
 		create_sql => 'CREATE PUBLICATION pub1;',
@@ -4510,6 +4520,22 @@ my %tests = (
 		},
 	},
 
+	'GRANT SELECT ON PROPERTY GRAPH propgraph' => {
+		create_order => 21,
+		create_sql =>
+		  'GRANT SELECT ON PROPERTY GRAPH dump_test.propgraph TO regress_dump_test_role;',
+		regexp => qr/^
+			\QGRANT ALL ON PROPERTY GRAPH dump_test.propgraph TO regress_dump_test_role;\E
+			/xm,
+		like =>
+		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
+		unlike => {
+			exclude_dump_test_schema => 1,
+			no_privs => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
 	'GRANT EXECUTE ON FUNCTION pg_sleep() TO regress_dump_test_role' => {
 		create_order => 16,
 		create_sql => 'GRANT EXECUTE ON FUNCTION pg_sleep(float8)
@@ -5079,8 +5105,8 @@ command_fails_like(
 		'--schema-only',
 		'--statistics',
 	],
-	qr/\Qpg_dump: error: options -s\/--schema-only and --statistics cannot be used together\E/,
-	'cannot use --schema-only and --statistics together');
+	qr/\Qpg_dump: error: options --statistics and -s\/--schema-only cannot be used together\E/,
+	'cannot use --statistics and --schema-only together');
 
 command_fails_like(
 	[

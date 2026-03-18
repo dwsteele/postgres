@@ -26,6 +26,7 @@
 
 #include "access/heapam.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "commands/copyapi.h"
@@ -1653,7 +1654,7 @@ BeginCopyFrom(ParseState *pstate,
 
 			Form_pg_attribute att = TupleDescAttr(tupDesc, attno - 1);
 
-			cstate->domain_with_constraint[i] = DomainHasConstraints(att->atttypid);
+			cstate->domain_with_constraint[i] = DomainHasConstraints(att->atttypid, NULL);
 		}
 	}
 
@@ -1746,6 +1747,7 @@ BeginCopyFrom(ParseState *pstate,
 	cstate->cur_attname = NULL;
 	cstate->cur_attval = NULL;
 	cstate->relname_only = false;
+	cstate->simd_enabled = true;
 
 	/*
 	 * Allocate buffers for the input pipeline.

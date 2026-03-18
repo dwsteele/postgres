@@ -65,6 +65,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/ps_status.h"
 #include "utils/pg_rusage.h"
+#include "utils/wait_event.h"
 
 /* Unsupported old recovery command file names (relative to $PGDATA) */
 #define RECOVERY_COMMAND_FILE	"recovery.conf"
@@ -741,7 +742,7 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 			 * can't read the last checkpoint because this allows us to
 			 * simplify processing around checkpoints.
 			 */
-			ereport(PANIC,
+			ereport(FATAL,
 					errmsg("could not locate a valid checkpoint record at %X/%08X",
 						   LSN_FORMAT_ARGS(CheckPointLoc)));
 		}

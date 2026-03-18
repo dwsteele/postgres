@@ -40,6 +40,7 @@
 #include "lib/bloomfilter.h"
 #include "lib/qunique.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "storage/large_object.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -652,6 +653,10 @@ aclitemin(PG_FUNCTION_ARGS)
  *		Allocates storage for, and fills in, a new null-delimited string
  *		containing a formatted ACL specification.  See aclparse for details.
  *
+ *		In bootstrap mode, this is called for debug printouts (initdb -d).
+ *		We could ask bootstrap.c to provide an inverse of boot_get_role_oid(),
+ *		but it seems at least as useful to just print numeric role OIDs.
+ *
  * RETURNS:
  *		the new string
  */
@@ -674,7 +679,10 @@ aclitemout(PG_FUNCTION_ARGS)
 
 	if (aip->ai_grantee != ACL_ID_PUBLIC)
 	{
-		htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aip->ai_grantee));
+		if (!IsBootstrapProcessingMode())
+			htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aip->ai_grantee));
+		else
+			htup = NULL;
 		if (HeapTupleIsValid(htup))
 		{
 			putid(p, NameStr(((Form_pg_authid) GETSTRUCT(htup))->rolname));
@@ -682,7 +690,7 @@ aclitemout(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			/* Generate numeric OID if we don't find an entry */
+			/* No such entry, or bootstrap mode: print numeric OID */
 			sprintf(p, "%u", aip->ai_grantee);
 		}
 	}
@@ -702,7 +710,10 @@ aclitemout(PG_FUNCTION_ARGS)
 	*p++ = '/';
 	*p = '\0';
 
-	htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aip->ai_grantor));
+	if (!IsBootstrapProcessingMode())
+		htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aip->ai_grantor));
+	else
+		htup = NULL;
 	if (HeapTupleIsValid(htup))
 	{
 		putid(p, NameStr(((Form_pg_authid) GETSTRUCT(htup))->rolname));
@@ -710,7 +721,7 @@ aclitemout(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		/* Generate numeric OID if we don't find an entry */
+		/* No such entry, or bootstrap mode: print numeric OID */
 		sprintf(p, "%u", aip->ai_grantor);
 	}
 
@@ -879,6 +890,10 @@ acldefault(ObjectType objtype, Oid ownerId)
 		case OBJECT_PARAMETER_ACL:
 			world_default = ACL_NO_RIGHTS;
 			owner_default = ACL_ALL_RIGHTS_PARAMETER_ACL;
+			break;
+		case OBJECT_PROPGRAPH:
+			world_default = ACL_NO_RIGHTS;
+			owner_default = ACL_ALL_RIGHTS_PROPGRAPH;
 			break;
 		default:
 			elog(ERROR, "unrecognized object type: %d", (int) objtype);
@@ -1831,6 +1846,7 @@ aclexplode(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "is_grantable",
 						   BOOLOID, -1, 0);
 
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		/* allocate memory for user context */

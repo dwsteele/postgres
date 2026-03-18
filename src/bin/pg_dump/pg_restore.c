@@ -68,7 +68,7 @@ static int	restore_all_databases(const char *inputFileSpec,
 static int	get_dbnames_list_to_restore(PGconn *conn,
 										SimplePtrList *dbname_oid_list,
 										SimpleStringList db_exclude_patterns);
-static int	get_dbname_oid_list_from_mfile(const char *dumpdirpatharg,
+static int	get_dbname_oid_list_from_mfile(const char *dumpdirpath,
 										   SimplePtrList *dbname_oid_list);
 
 /*
@@ -385,31 +385,20 @@ main(int argc, char **argv)
 	if (!opts->cparams.dbname && !opts->filename && !opts->tocSummary)
 		pg_fatal("one of -d/--dbname and -f/--file must be specified");
 
-	if (db_exclude_patterns.head != NULL && globals_only)
-	{
-		pg_log_error("option %s cannot be used together with %s",
-					 "--exclude-database", "-g/--globals-only");
-		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
-		exit_nicely(1);
-	}
+	/* --exclude-database and --globals-only are incompatible */
+	check_mut_excl_opts(db_exclude_patterns.head, "--exclude-database",
+						globals_only, "-g/--globals-only");
 
 	/* Should get at most one of -d and -f, else user is confused */
+	check_mut_excl_opts(opts->cparams.dbname, "-d/--dbname",
+						opts->filename, "-f/--file");
+
+	/* --dbname and --restrict-key are incompatible */
+	check_mut_excl_opts(opts->cparams.dbname, "-d/--dbname",
+						opts->restrict_key, "--restrict-key");
+
 	if (opts->cparams.dbname)
-	{
-		if (opts->filename)
-		{
-			pg_log_error("options %s and %s cannot be used together",
-						 "-d/--dbname", "-f/--file");
-			pg_log_error_hint("Try \"%s --help\" for more information.", progname);
-			exit_nicely(1);
-		}
-
-		if (opts->restrict_key)
-			pg_fatal("options %s and %s cannot be used together",
-					 "-d/--dbname", "--restrict-key");
-
 		opts->useDB = 1;
-	}
 	else
 	{
 		/*
@@ -423,85 +412,54 @@ main(int argc, char **argv)
 			pg_fatal("invalid restrict key");
 	}
 
-	/* reject conflicting "-only" options */
-	if (data_only && schema_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-s/--schema-only", "-a/--data-only");
-	if (schema_only && statistics_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-s/--schema-only", "--statistics-only");
-	if (data_only && statistics_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-a/--data-only", "--statistics-only");
+	/* *-only options are incompatible with each other */
+	check_mut_excl_opts(data_only, "-a/--data-only",
+						globals_only, "-g/--globals-only",
+						schema_only, "-s/--schema-only",
+						statistics_only, "--statistics-only");
 
-	/* reject conflicting "-only" and "no-" options */
-	if (data_only && no_data)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-a/--data-only", "--no-data");
-	if (schema_only && no_schema)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-s/--schema-only", "--no-schema");
-	if (statistics_only && no_statistics)
-		pg_fatal("options %s and %s cannot be used together",
-				 "--statistics-only", "--no-statistics");
+	/* --no-* and *-only for same thing are incompatible */
+	check_mut_excl_opts(data_only, "-a/--data-only",
+						no_data, "--no-data");
+	check_mut_excl_opts(globals_only, "-g/--globals-only",
+						no_globals, "--no-globals");
+	check_mut_excl_opts(schema_only, "-s/--schema-only",
+						no_schema, "--no-schema");
+	check_mut_excl_opts(statistics_only, "--statistics-only",
+						no_statistics, "--no-statistics");
 
-	/* reject conflicting "no-" options */
-	if (with_statistics && no_statistics)
-		pg_fatal("options %s and %s cannot be used together",
-				 "--statistics", "--no-statistics");
+	/* --statistics and --no-statistics are incompatible */
+	check_mut_excl_opts(with_statistics, "--statistics",
+						no_statistics, "--no-statistics");
 
-	/* reject conflicting "only-" options */
-	if (data_only && with_statistics)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-a/--data-only", "--statistics");
-	if (schema_only && with_statistics)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-s/--schema-only", "--statistics");
+	/* --statistics is incompatible with *-only (except --statistics-only) */
+	check_mut_excl_opts(with_statistics, "--statistics",
+						data_only, "-a/--data-only",
+						globals_only, "-g/--globals-only",
+						schema_only, "-s/--schema-only");
 
-	if (data_only && opts->dropSchema)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-c/--clean", "-a/--data-only");
+	/* --clean and --data-only are incompatible */
+	check_mut_excl_opts(opts->dropSchema, "-c/--clean",
+						data_only, "-a/--data-only");
 
-	if (opts->single_txn && opts->txn_size > 0)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-1/--single-transaction", "--transaction-size");
+	/*
+	 * --globals-only, --single-transaction, and --transaction-size are
+	 * incompatible.
+	 */
+	check_mut_excl_opts(globals_only, "-g/--globals-only",
+						opts->single_txn, "-1/--single-transaction",
+						opts->txn_size, "--transaction-size");
 
-	if (opts->single_txn && globals_only)
-		pg_fatal("options %s and %s cannot be used together when restoring an archive created by pg_dumpall",
-				 "--single-transaction", "-g/--globals-only");
-
-	if (opts->txn_size && globals_only)
-		pg_fatal("options %s and %s cannot be used together when restoring an archive created by pg_dumpall",
-				 "--transaction-size", "-g/--globals-only");
-
-	if (opts->exit_on_error && globals_only)
-		pg_fatal("options %s and %s cannot be used together when restoring an archive created by pg_dumpall",
-				 "--exit-on-error", "-g/--globals-only");
-
-	if (data_only && globals_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-a/--data-only", "-g/--globals-only");
-	if (schema_only && globals_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-s/--schema-only", "-g/--globals-only");
-	if (statistics_only && globals_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "--statistics-only", "-g/--globals-only");
-	if (with_statistics && globals_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "--statistics", "-g/--globals-only");
-
-	if (no_globals && globals_only)
-		pg_fatal("options %s and %s cannot be used together",
-				 "--no-globals", "-g/--globals-only");
+	/* --exit-on-error and --globals-only are incompatible */
+	check_mut_excl_opts(opts->exit_on_error, "--exit-on-error",
+						globals_only, "-g/--globals-only");
 
 	/*
 	 * -C is not compatible with -1, because we can't create a database inside
 	 * a transaction block.
 	 */
-	if (opts->createDB && opts->single_txn)
-		pg_fatal("options %s and %s cannot be used together",
-				 "-C/--create", "-1/--single-transaction");
+	check_mut_excl_opts(opts->createDB, "-C/--create",
+						opts->single_txn, "-1/--single-transaction");
 
 	/* Can't do single-txn mode with multiple connections */
 	if (opts->single_txn && numWorkers > 1)
@@ -1093,14 +1051,13 @@ get_dbnames_list_to_restore(PGconn *conn,
  * Returns, total number of database names in map.dat file.
  */
 static int
-get_dbname_oid_list_from_mfile(const char *dumpdirpatharg, SimplePtrList *dbname_oid_list)
+get_dbname_oid_list_from_mfile(const char *dumpdirpath,
+							   SimplePtrList *dbname_oid_list)
 {
 	StringInfoData linebuf;
 	FILE	   *pfile;
 	char		map_file_path[MAXPGPATH];
 	int			count = 0;
-	int			len;
-	char	   *dumpdirpath = pstrdup(dumpdirpatharg);
 
 	/*
 	 * If there is no map.dat file in the dump, then return from here as there
@@ -1110,15 +1067,6 @@ get_dbname_oid_list_from_mfile(const char *dumpdirpatharg, SimplePtrList *dbname
 	{
 		pg_log_info("database restoring is skipped because file \"%s\" does not exist in directory \"%s\"", "map.dat", dumpdirpath);
 		return 0;
-	}
-
-	len = strlen(dumpdirpath);
-
-	/* Trim slash from directory name. */
-	while (len > 1 && dumpdirpath[len - 1] == '/')
-	{
-		dumpdirpath[len - 1] = '\0';
-		len--;
 	}
 
 	snprintf(map_file_path, MAXPGPATH, "%s/map.dat", dumpdirpath);
@@ -1309,16 +1257,6 @@ restore_all_databases(const char *inputFileSpec,
 		 * "opts" for each call to restore_one_database.
 		 */
 		memcpy(tmpopts, original_opts, sizeof(RestoreOptions));
-
-		/*
-		 * We need to reset override_dbname so that objects can be restored
-		 * into an already created database. (used with -d/--dbname option)
-		 */
-		if (tmpopts->cparams.override_dbname)
-		{
-			pfree(tmpopts->cparams.override_dbname);
-			tmpopts->cparams.override_dbname = NULL;
-		}
 
 		snprintf(subdirdbpath, MAXPGPATH, "%s/databases", inputFileSpec);
 
