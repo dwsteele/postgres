@@ -178,18 +178,18 @@ pg_backup_stop(PG_FUNCTION_ARGS)
 	Assert(backup_state != NULL);
 	Assert(tablespace_map != NULL);
 
-	/* Stop the backup */
-	do_pg_backup_stop(backup_state, waitforarchive);
-
-	/* Build the contents of backup_label */
-	backup_label = build_backup_content(backup_state, false);
-
 	/* Build the contents of pg_control */
 	backup_control_file(pg_control);
 
 	pg_control_bytea = (bytea *) palloc(PG_CONTROL_FILE_SIZE + VARHDRSZ);
 	SET_VARSIZE(pg_control_bytea, PG_CONTROL_FILE_SIZE + VARHDRSZ);
 	memcpy(VARDATA(pg_control_bytea), pg_control, PG_CONTROL_FILE_SIZE);
+
+	/* Stop the backup */
+	do_pg_backup_stop(backup_state, waitforarchive);
+
+	/* Build the contents of backup_label */
+	backup_label = build_backup_content(backup_state, false);
 
 	values[0] = LSNGetDatum(backup_state->stoppoint);
 	values[1] = CStringGetTextDatum(backup_label);
