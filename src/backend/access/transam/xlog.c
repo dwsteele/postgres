@@ -10077,16 +10077,18 @@ do_pg_abort_backup(int code, Datum arg)
 /*
  * Create a consistent copy of control data to be used for backup and update it
  * to require a backup label for recovery. Also recalculate the CRC.
+ *
+ * All field access is done through a local, properly-aligned ControlFileData;
+ * the caller's buffer is only ever written via memcpy() and so need not be
+ * aligned for ControlFileData (e.g. it may point into the payload of a bytea).
  */
 void
 backup_control_file(uint8 *controlFile)
 {
-	ControlFileData *controlData = ((ControlFileData *)controlFile);
-
-	memset(controlFile, 0, PG_CONTROL_FILE_SIZE);
+	ControlFileData controlData;
 
 	LWLockAcquire(ControlFileLock, LW_SHARED);
-	memcpy(controlFile, ControlFile, sizeof(ControlFileData));
+	memcpy(&controlData, ControlFile, sizeof(ControlFileData));
 
 #ifdef USE_ASSERT_CHECKING
 	/*
@@ -10097,7 +10099,7 @@ backup_control_file(uint8 *controlFile)
 		ControlFileData *dataDisk = get_controlfile(DataDir, &crc_ok);
 
 		Assert(crc_ok &&
-			   memcmp(dataDisk, controlFile, sizeof(ControlFileData)) == 0);
+			   memcmp(dataDisk, &controlData, sizeof(ControlFileData)) == 0);
 
 		pfree(dataDisk);
 	}
@@ -10105,11 +10107,15 @@ backup_control_file(uint8 *controlFile)
 
 	LWLockRelease(ControlFileLock);
 
-	controlData->backupLabelRequired = true;
+	controlData.backupLabelRequired = true;
 
-	INIT_CRC32C(controlData->crc);
-	COMP_CRC32C(controlData->crc, controlFile, offsetof(ControlFileData, crc));
-	FIN_CRC32C(controlData->crc);
+	INIT_CRC32C(controlData.crc);
+	COMP_CRC32C(controlData.crc, &controlData, offsetof(ControlFileData, crc));
+	FIN_CRC32C(controlData.crc);
+
+	/* Copy into the caller's buffer, zero-padded to the full file size */
+	memset(controlFile, 0, PG_CONTROL_FILE_SIZE);
+	memcpy(controlFile, &controlData, sizeof(ControlFileData));
 }
 
 /*
