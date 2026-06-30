@@ -335,7 +335,7 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 			{
 				bool		sendtblspclinks = true;
 				char	   *backup_label;
-				uint8_t controlFile[PG_CONTROL_FILE_SIZE];
+				uint8		controlFile[PG_CONTROL_FILE_SIZE];
 
 				bbsink_begin_archive(sink, "base.tar");
 
