@@ -162,7 +162,7 @@ pg_backup_stop(PG_FUNCTION_ARGS)
 	bool		waitforarchive = PG_GETARG_BOOL(0);
 	char	   *backup_label;
 	bytea	   *pg_control_bytea;
-	uint8_t		pg_control[PG_CONTROL_FILE_SIZE];
+	uint8		pg_control[PG_CONTROL_FILE_SIZE];
 	SessionBackupState status = get_backup_status();
 
 	/* Initialize attributes information in the tuple descriptor */

@@ -13,22 +13,6 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-# Decode hex to binary
-sub decode_hex
-{
-	my ($encoded) = @_;
-	my $decoded;
-
-	$encoded =~ s/^\s+|\s+$//g;
-
-	for (my $idx = 0; $idx < length($encoded); $idx += 2)
-	{
-		$decoded .= pack('C', hex(substr($encoded, $idx, 2)));
-	}
-
-	return $decoded;
-}
-
 # Get backup_label/pg_control from pg_stop_backup()
 sub stop_backup_result
 {
@@ -41,9 +25,10 @@ sub stop_backup_result
 
 	my @result;
 
-    foreach my $column (split(',', $encoded))
+	foreach my $column (split(',', $encoded))
 	{
-		push(@result, decode_hex($column));
+		$column =~ s/^\s+|\s+$//g;
+		push(@result, pack("H*", $column));
 	}
 
 	return @result;
