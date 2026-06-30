@@ -10079,7 +10079,7 @@ do_pg_abort_backup(int code, Datum arg)
  * to require a backup label for recovery. Also recalculate the CRC.
  */
 void
-backup_control_file(uint8_t *controlFile)
+backup_control_file(uint8 *controlFile)
 {
 	ControlFileData *controlData = ((ControlFileData *)controlFile);
 
@@ -10098,6 +10098,8 @@ backup_control_file(uint8_t *controlFile)
 
 		Assert(crc_ok &&
 			   memcmp(dataDisk, controlFile, sizeof(ControlFileData)) == 0);
+
+		pfree(dataDisk);
 	}
 #endif
 
