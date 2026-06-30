@@ -476,10 +476,11 @@ ResolveRecoveryConflictWithSnapshot(TransactionId snapshotConflictHorizon,
 	/*
 	 * If we get passed InvalidTransactionId then we do nothing (no conflict).
 	 *
-	 * This can happen when replaying already-applied WAL records after a
-	 * standby crash or restart, or when replaying an XLOG_HEAP2_VISIBLE
-	 * record that marks as frozen a page which was already all-visible.  It's
-	 * also quite common with records generated during index deletion
+	 * This can happen whenever the changes in the WAL record do not affect
+	 * visibility on a standby. For example: a record that only freezes an
+	 * xmax from a locker.
+	 *
+	 * It's also quite common with records generated during index deletion
 	 * (original execution of the deletion can reason that a recovery conflict
 	 * which is sufficient for the deletion operation must take place before
 	 * replay of the deletion record itself).
@@ -1018,14 +1019,14 @@ StandbyAcquireAccessExclusiveLock(TransactionId xid, Oid dbOid, Oid relOid)
 	lockentry = hash_search(RecoveryLockHash, &key, HASH_ENTER, &found);
 	if (!found)
 	{
-		/* It's new, so link it into the XID's list ... */
-		lockentry->next = xidentry->head;
-		xidentry->head = lockentry;
-
-		/* ... and acquire the lock locally. */
+		/* First, acquire the lock ... */
 		SET_LOCKTAG_RELATION(locktag, dbOid, relOid);
 
 		(void) LockAcquire(&locktag, AccessExclusiveLock, true, false);
+
+		/* ... and then, as it is new, link it into the XID's list. */
+		lockentry->next = xidentry->head;
+		xidentry->head = lockentry;
 	}
 }
 

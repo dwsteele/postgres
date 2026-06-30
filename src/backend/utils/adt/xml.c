@@ -660,7 +660,7 @@ texttoxml(PG_FUNCTION_ARGS)
 {
 	text	   *data = PG_GETARG_TEXT_PP(0);
 
-	PG_RETURN_XML_P(xmlparse(data, xmloption, true));
+	PG_RETURN_XML_P(xmlparse(data, xmloption, true, fcinfo->context));
 }
 
 
@@ -1029,14 +1029,18 @@ xmlelement(XmlExpr *xexpr,
 
 
 xmltype *
-xmlparse(text *data, XmlOptionType xmloption_arg, bool preserve_whitespace)
+xmlparse(text *data, XmlOptionType xmloption_arg, bool preserve_whitespace, Node *escontext)
 {
 #ifdef USE_LIBXML
 	xmlDocPtr	doc;
 
 	doc = xml_parse(data, xmloption_arg, preserve_whitespace,
-					GetDatabaseEncoding(), NULL, NULL, NULL);
-	xmlFreeDoc(doc);
+					GetDatabaseEncoding(), NULL, NULL, escontext);
+	if (doc)
+		xmlFreeDoc(doc);
+
+	if (SOFT_ERROR_OCCURRED(escontext))
+		return NULL;
 
 	return (xmltype *) data;
 #else
@@ -4195,7 +4199,9 @@ xml_xmlnodetoxmltype(xmlNodePtr cur, PgXmlErrorContext *xmlerrcxt)
 {
 	xmltype    *result = NULL;
 
-	if (cur->type != XML_ATTRIBUTE_NODE && cur->type != XML_TEXT_NODE)
+	if (cur->type != XML_ATTRIBUTE_NODE &&
+		cur->type != XML_TEXT_NODE &&
+		cur->type != XML_NAMESPACE_DECL)
 	{
 		void		(*volatile nodefree) (xmlNodePtr) = NULL;
 		volatile xmlBufferPtr buf = NULL;

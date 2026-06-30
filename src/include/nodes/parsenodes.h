@@ -109,10 +109,13 @@ typedef uint64 AclMode;			/* a bitmask of privilege bits */
  *	  Planning converts a Query tree into a Plan tree headed by a PlannedStmt
  *	  node --- the Query structure is not used by the executor.
  *
- *	  All the fields ignored for the query jumbling are not semantically
- *	  significant (such as alias names), as is ignored anything that can
- *	  be deduced from child nodes (else we'd just be double-hashing that
- *	  piece of information).
+ *	  We ignore fields for query jumbling if they are not semantically
+ *	  significant (such as alias names).  We also ignore anything that can
+ *	  be deduced from other fields or child nodes, else we'd just be
+ *	  double-hashing that piece of information.  In some places query jumbling
+ *	  deliberately ignores fields that are semantically significant, such as
+ *	  Const values, because we have made a policy decision to combine queries
+ *	  that differ only in those respects.
  */
 typedef struct Query
 {
@@ -125,8 +128,8 @@ typedef struct Query
 
 	/*
 	 * query identifier (can be set by plugins); ignored for equal, as it
-	 * might not be set; also not stored.  This is the result of the query
-	 * jumble, hence ignored.
+	 * might not be set; also not stored.  This is the output of query
+	 * jumbling, hence it must be ignored as an input.
 	 *
 	 * We store this as a signed value as this is the form it's displayed to
 	 * users in places such as EXPLAIN and pg_stat_statements.  Primarily this
@@ -142,10 +145,12 @@ typedef struct Query
 
 	/*
 	 * rtable index of target relation for INSERT/UPDATE/DELETE/MERGE; 0 for
-	 * SELECT.  This is ignored in the query jumble as unrelated to the
-	 * compilation of the query ID.
+	 * SELECT.
 	 */
 	int			resultRelation pg_node_attr(query_jumble_ignore);
+
+	/* FOR PORTION OF clause for UPDATE/DELETE */
+	ForPortionOfExpr *forPortionOf;
 
 	/* has aggregates in tlist or havingQual */
 	bool		hasAggs pg_node_attr(query_jumble_ignore);
@@ -793,7 +798,7 @@ typedef struct TableLikeClause
 {
 	NodeTag		type;
 	RangeVar   *relation;
-	bits32		options;		/* OR of TableLikeOption flags */
+	uint32		options;		/* OR of TableLikeOption flags */
 	Oid			relationOid;	/* If table has been looked up, its OID */
 } TableLikeClause;
 
@@ -1424,8 +1429,6 @@ typedef struct RTEPermissionInfo
  * time.  We do however remember how many columns we thought the type had
  * (including dropped columns!), so that we can successfully ignore any
  * columns added after the query was parsed.
- *
- * The query jumbling only needs to track the function expression.
  */
 typedef struct RangeTblFunction
 {
@@ -1644,9 +1647,6 @@ typedef struct GroupingSet
  * When refname isn't null, the partitionClause is always copied from there;
  * the orderClause might or might not be copied (see copiedOrder); the framing
  * options are never copied, per spec.
- *
- * The information relevant for the query jumbling is the partition clause
- * type and its bounds.
  */
 typedef struct WindowClause
 {
@@ -1696,6 +1696,22 @@ typedef struct RowMarkClause
 	LockWaitPolicy waitPolicy;	/* NOWAIT and SKIP LOCKED */
 	bool		pushedDown;		/* pushed down from higher query level? */
 } RowMarkClause;
+
+/*
+ * ForPortionOfClause
+ *		representation of FOR PORTION OF <range-name> FROM <target-start> TO
+ *		<target-end> or FOR PORTION OF <range-name> (<target>)
+ */
+typedef struct ForPortionOfClause
+{
+	NodeTag		type;
+	char	   *range_name;		/* column name of the range/multirange */
+	ParseLoc	location;		/* token location, or -1 if unknown */
+	ParseLoc	target_location;	/* token location, or -1 if unknown */
+	Node	   *target;			/* Expr from FOR PORTION OF col (...) syntax */
+	Node	   *target_start;	/* Expr from FROM ... TO ... syntax */
+	Node	   *target_end;		/* Expr from FROM ... TO ... syntax */
+} ForPortionOfClause;
 
 /*
  * WithClause -
@@ -1804,7 +1820,7 @@ typedef struct CommonTableExpr
 
 	/*
 	 * Number of RTEs referencing this CTE (excluding internal
-	 * self-references), irrelevant for query jumbling.
+	 * self-references).
 	 */
 	int			cterefcount pg_node_attr(query_jumble_ignore);
 	/* list of output column names */
@@ -2211,6 +2227,7 @@ typedef struct DeleteStmt
 	Node	   *whereClause;	/* qualifications */
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
+	ForPortionOfClause *forPortionOf;	/* FOR PORTION OF clause */
 } DeleteStmt;
 
 /* ----------------------
@@ -2226,6 +2243,7 @@ typedef struct UpdateStmt
 	List	   *fromClause;		/* optional from clause for more tables */
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
+	ForPortionOfClause *forPortionOf;	/* FOR PORTION OF clause */
 } UpdateStmt;
 
 /* ----------------------
@@ -2343,7 +2361,7 @@ typedef struct SetOperationStmt
 	Node	   *rarg;			/* right child */
 	/* Eventually add fields for CORRESPONDING spec here */
 
-	/* Fields derived during parse analysis (irrelevant for query jumbling): */
+	/* Fields derived during parse analysis: */
 	/* OID list of output column type OIDs */
 	List	   *colTypes pg_node_attr(query_jumble_ignore);
 	/* integer list of output column typmods */
@@ -2672,7 +2690,7 @@ typedef struct GrantStmt
 	/* privileges == NIL denotes ALL PRIVILEGES */
 	List	   *grantees;		/* list of RoleSpec nodes */
 	bool		grant_option;	/* grant or revoke grant option */
-	RoleSpec   *grantor;
+	RoleSpec   *grantor;		/* GRANTED BY clause, or NULL if none */
 	DropBehavior behavior;		/* drop behavior (for REVOKE) */
 } GrantStmt;
 
@@ -3719,8 +3737,6 @@ typedef struct InlineCodeBlock
  * list contains copies of the expressions for all output arguments, in the
  * order of the procedure's declared arguments.  (outargs is never evaluated,
  * but is useful to the caller as a reference for what to assign to.)
- * The transformed call state is not relevant in the query jumbling, only the
- * function call is.
  * ----------------------
  */
 typedef struct CallStmt
@@ -4525,6 +4541,8 @@ typedef struct AlterPublicationStmt
 	List	   *pubobjects;		/* Optional list of publication objects */
 	AlterPublicationAction action;	/* What action to perform with the given
 									 * objects */
+	bool		for_all_tables; /* True if ALL TABLES is specified */
+	bool		for_all_sequences;	/* True if ALL SEQUENCES is specified */
 } AlterPublicationStmt;
 
 typedef struct CreateSubscriptionStmt

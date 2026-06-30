@@ -224,7 +224,7 @@ make_subplan(PlannerInfo *root, Query *orig_subquery,
 	/* Generate Paths for the subquery */
 	subroot = subquery_planner(root->glob, subquery,
 							   choose_plan_name(root->glob, sublinkstr, true),
-							   root, false, tuple_fraction, NULL);
+							   root, NULL, false, tuple_fraction, NULL);
 
 	/* Isolate the params needed by this specific subplan */
 	plan_params = root->plan_params;
@@ -274,7 +274,7 @@ make_subplan(PlannerInfo *root, Query *orig_subquery,
 			/* Generate Paths for the ANY subquery; we'll need all rows */
 			plan_name = choose_plan_name(root->glob, sublinkstr, true);
 			subroot = subquery_planner(root->glob, subquery, plan_name,
-									   root, false, 0.0, NULL);
+									   root, subroot, false, 0.0, NULL);
 
 			/* Isolate the params needed by this specific subplan */
 			plan_params = root->plan_params;
@@ -841,7 +841,9 @@ hash_ok_operator(OpExpr *expr)
 	if (list_length(expr->args) != 2)
 		return false;
 	if (opid == ARRAY_EQ_OP ||
-		opid == RECORD_EQ_OP)
+		opid == RECORD_EQ_OP ||
+		opid == RANGE_EQ_OP ||
+		opid == MULTIRANGE_EQ_OP)
 	{
 		/* these are strict, but must check input type to ensure hashable */
 		Node	   *leftarg = linitial(expr->args);
@@ -971,7 +973,7 @@ SS_process_ctes(PlannerInfo *root)
 		 */
 		subroot = subquery_planner(root->glob, subquery,
 								   choose_plan_name(root->glob, cte->ctename, false),
-								   root, cte->cterecursive, 0.0, NULL);
+								   root, NULL, cte->cterecursive, 0.0, NULL);
 
 		/*
 		 * Since the current query level doesn't yet contain any RTEs, it

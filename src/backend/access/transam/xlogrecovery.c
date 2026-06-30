@@ -58,6 +58,7 @@
 #include "storage/pmsignal.h"
 #include "storage/procarray.h"
 #include "storage/spin.h"
+#include "storage/subsystems.h"
 #include "utils/datetime.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc_hooks.h"
@@ -307,6 +308,14 @@ static char *primary_image_masked = NULL;
 
 XLogRecoveryCtlData *XLogRecoveryCtl = NULL;
 
+static void XLogRecoveryShmemRequest(void *arg);
+static void XLogRecoveryShmemInit(void *arg);
+
+const ShmemCallbacks XLogRecoveryShmemCallbacks = {
+	.request_fn = XLogRecoveryShmemRequest,
+	.init_fn = XLogRecoveryShmemInit,
+};
+
 /*
  * abortedRecPtr is the start pointer of a broken record at end of WAL when
  * recovery completes; missingContrecPtr is the location of the first
@@ -385,28 +394,20 @@ static void SetCurrentChunkStartTime(TimestampTz xtime);
 static void SetLatestXTime(TimestampTz xtime);
 
 /*
- * Initialization of shared memory for WAL recovery
+ * Register shared memory for WAL recovery
  */
-Size
-XLogRecoveryShmemSize(void)
+static void
+XLogRecoveryShmemRequest(void *arg)
 {
-	Size		size;
-
-	/* XLogRecoveryCtl */
-	size = sizeof(XLogRecoveryCtlData);
-
-	return size;
+	ShmemRequestStruct(.name = "XLOG Recovery Ctl",
+					   .size = sizeof(XLogRecoveryCtlData),
+					   .ptr = (void **) &XLogRecoveryCtl,
+		);
 }
 
-void
-XLogRecoveryShmemInit(void)
+static void
+XLogRecoveryShmemInit(void *arg)
 {
-	bool		found;
-
-	XLogRecoveryCtl = (XLogRecoveryCtlData *)
-		ShmemInitStruct("XLOG Recovery Ctl", XLogRecoveryShmemSize(), &found);
-	if (found)
-		return;
 	memset(XLogRecoveryCtl, 0, sizeof(XLogRecoveryCtlData));
 
 	SpinLockInit(&XLogRecoveryCtl->info_lck);
@@ -446,7 +447,7 @@ EnableStandbyMode(void)
  * the checkpoint record.  On entry, the caller has already read the control
  * file into memory, and passes it as argument.  This function updates it to
  * reflect the recovery state, and the caller is expected to write it back to
- * disk does after initializing other subsystems, but before calling
+ * disk after initializing other subsystems, but before calling
  * PerformWalRecovery().
  *
  * This initializes some global variables like ArchiveRecoveryRequested, and
@@ -1798,14 +1799,17 @@ PerformWalRecovery(void)
 			ApplyWalRecord(xlogreader, record, &replayTLI);
 
 			/*
-			 * If we replayed an LSN that someone was waiting for then walk
-			 * over the shared memory array and set latches to notify the
-			 * waiters.
+			 * Wake up processes waiting for standby replay, write, or flush
+			 * LSN to reach current replay position.  Replay implies that the
+			 * WAL was already written and flushed to disk, so write and flush
+			 * waiters can be woken at the replay position too.
 			 */
-			if (waitLSNState &&
-				(XLogRecoveryCtl->lastReplayedEndRecPtr >=
-				 pg_atomic_read_u64(&waitLSNState->minWaitedLSN[WAIT_LSN_TYPE_STANDBY_REPLAY])))
-				WaitLSNWakeup(WAIT_LSN_TYPE_STANDBY_REPLAY, XLogRecoveryCtl->lastReplayedEndRecPtr);
+			WaitLSNWakeup(WAIT_LSN_TYPE_STANDBY_REPLAY,
+						  XLogRecoveryCtl->lastReplayedEndRecPtr);
+			WaitLSNWakeup(WAIT_LSN_TYPE_STANDBY_WRITE,
+						  XLogRecoveryCtl->lastReplayedEndRecPtr);
+			WaitLSNWakeup(WAIT_LSN_TYPE_STANDBY_FLUSH,
+						  XLogRecoveryCtl->lastReplayedEndRecPtr);
 
 			/* Exit loop if we reached inclusive recovery target */
 			if (recoveryStopsAfter(xlogreader))
@@ -2032,7 +2036,7 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	if (doRequestWalReceiverReply)
 	{
 		doRequestWalReceiverReply = false;
-		WalRcvForceReply();
+		WalRcvRequestApplyReply();
 	}
 
 	/* Allow read-only connections if we're consistent now */
@@ -3403,8 +3407,10 @@ retry:
 
 		pgstat_report_wait_end();
 
-		pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL, IOOP_READ,
-								io_start, 1, r);
+		/* Count I/O stats only for successful short reads */
+		if (r > 0)
+			pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL, IOOP_READ,
+									io_start, 1, r);
 
 		XLogFileName(fname, curFileTLI, readSegNo, wal_segment_size);
 		if (r < 0)
@@ -3987,7 +3993,7 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 					 */
 					if (!streaming_reply_sent)
 					{
-						WalRcvForceReply();
+						WalRcvRequestApplyReply();
 						streaming_reply_sent = true;
 					}
 

@@ -1047,6 +1047,34 @@ TransactionStartedDuringRecovery(void)
 }
 
 /*
+ *	GetTopReadOnlyTransactionNestLevel
+ *
+ * Note: this will return zero when not inside any transaction or when neither
+ * a top-level transaction nor subtransactions are read-only, one when the
+ * top-level transaction is read-only, two when one level of subtransaction is
+ * read-only, etc.
+ *
+ * Note: subtransactions of the topmost read-only transaction are also
+ * read-only, because they inherit read-only mode from the transaction, and
+ * thus can't change to read-write mode (see check_transaction_read_only).
+ */
+int
+GetTopReadOnlyTransactionNestLevel(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (!XactReadOnly)
+		return 0;
+	while (s->nestingLevel > 1)
+	{
+		if (!s->prevXactReadOnly)
+			return s->nestingLevel;
+		s = s->parent;
+	}
+	return s->nestingLevel;
+}
+
+/*
  *	EnterParallelMode
  */
 void
@@ -2486,6 +2514,7 @@ CommitTransaction(void)
 	AtEOXact_Files(true);
 	AtEOXact_ComboCid();
 	AtEOXact_HashTables(true);
+	AtEOXact_RI(true);
 	AtEOXact_PgStat(true, is_parallel_worker);
 	AtEOXact_Snapshot(true, false);
 	AtEOXact_ApplyLauncher(true);
@@ -2781,6 +2810,7 @@ PrepareTransaction(void)
 	AtEOXact_Files(true);
 	AtEOXact_ComboCid();
 	AtEOXact_HashTables(true);
+	AtEOXact_RI(true);
 	/* don't call AtEOXact_PgStat here; we fixed pgstat state above */
 	AtEOXact_Snapshot(true, true);
 	/* we treat PREPARE as ROLLBACK so far as waking workers goes */
@@ -3011,6 +3041,7 @@ AbortTransaction(void)
 		AtEOXact_Files(false);
 		AtEOXact_ComboCid();
 		AtEOXact_HashTables(false);
+		AtEOXact_RI(false);
 		AtEOXact_PgStat(false, is_parallel_worker);
 		AtEOXact_ApplyLauncher(false);
 		AtEOXact_LogicalRepWorkers(false);
@@ -5261,6 +5292,11 @@ AbortSubTransaction(void)
 	 */
 	LWLockReleaseAll();
 
+	/*
+	 * Cleanup waiting for LSN if any.
+	 */
+	WaitLSNCleanup();
+
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();
 
@@ -6190,10 +6226,10 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		 * If a transaction completion record arrives that has as-yet
 		 * unobserved subtransactions then this will not have been fully
 		 * handled by the call to RecordKnownAssignedTransactionIds() in the
-		 * main recovery loop in xlog.c. So we need to do bookkeeping again to
-		 * cover that case. This is confusing and it is easy to think this
-		 * call is irrelevant, which has happened three times in development
-		 * already. Leave it in.
+		 * main recovery loop in PerformWalRecovery(). So we need to do
+		 * bookkeeping again to cover that case. This is confusing and it is
+		 * easy to think this call is irrelevant, which has happened three
+		 * times in development already. Leave it in.
 		 */
 		RecordKnownAssignedTransactionIds(max_xid);
 
@@ -6328,10 +6364,10 @@ xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid,
 		 * If a transaction completion record arrives that has as-yet
 		 * unobserved subtransactions then this will not have been fully
 		 * handled by the call to RecordKnownAssignedTransactionIds() in the
-		 * main recovery loop in xlog.c. So we need to do bookkeeping again to
-		 * cover that case. This is confusing and it is easy to think this
-		 * call is irrelevant, which has happened three times in development
-		 * already. Leave it in.
+		 * main recovery loop in PerformWalRecovery(). So we need to do
+		 * bookkeeping again to cover that case. This is confusing and it is
+		 * easy to think this call is irrelevant, which has happened three
+		 * times in development already. Leave it in.
 		 */
 		RecordKnownAssignedTransactionIds(max_xid);
 

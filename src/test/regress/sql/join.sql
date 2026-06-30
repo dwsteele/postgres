@@ -1726,12 +1726,12 @@ order by fault;
 explain (costs off)
 select * from
 (values (1, array[10,20]), (2, array[20,30])) as v1(v1x,v1ys)
-left join (values (1, 10), (2, 20)) as v2(v2x,v2y) on v2x = v1x
+left join (values (1, 10), (2, 20), (2, null)) as v2(v2x,v2y) on v2x = v1x
 left join unnest(v1ys) as u1(u1y) on u1y = v2y;
 
 select * from
 (values (1, array[10,20]), (2, array[20,30])) as v1(v1x,v1ys)
-left join (values (1, 10), (2, 20)) as v2(v2x,v2y) on v2x = v1x
+left join (values (1, 10), (2, 20), (2, null)) as v2(v2x,v2y) on v2x = v1x
 left join unnest(v1ys) as u1(u1y) on u1y = v2y;
 
 --
@@ -2271,6 +2271,29 @@ from int8_tbl t1
   left join onek t4
     on t2.q2 < t3.unique2;
 
+-- bug #19460: we need to clean up RestrictInfos more than we had been doing
+explain (costs off)
+select * from
+  (select 1::int as id) as lhs
+full join
+  (select dummy_source.id
+   from (select null::int as id) as dummy_source
+   left join (select a.id from a where a.id = 42) as sub
+   on sub.id = dummy_source.id
+  ) as rhs
+on lhs.id = rhs.id;
+
+explain (costs off)
+select * from
+  (select 1::int as id) as lhs
+full join
+  (select dummy_source.id
+   from (select 2::int as id) as dummy_source
+   left join (select a.id from a) as sub
+   on sub.id = dummy_source.id
+  ) as rhs
+on lhs.id = rhs.id;
+
 -- More tests of correct placement of pseudoconstant quals
 
 -- simple constant-false condition
@@ -2396,6 +2419,18 @@ CREATE TEMP TABLE parted_b1 partition of parted_b for values from (0) to (10);
 -- test join removals on a partitioned table
 explain (costs off)
 select a.* from a left join parted_b pb on a.b_id = pb.id;
+
+-- test that clauses that still embed PHVs are not referencing the removed
+-- relation when rebuilt for a partition of the kept relation
+explain (costs off)
+select 1 from (select t1.id from parted_b t1 left join parted_b t2 on t1.id = t2.id) s
+where s.id = 1 group by ();
+
+explain (costs off)
+select 1 from parted_b t1
+  join (select t2.id from parted_b t2 left join parted_b t3 on t2.id = t3.id) s
+  on t1.id = s.id
+group by ();
 
 rollback;
 
@@ -3156,6 +3191,12 @@ SELECT * FROM
 (SELECT n2.a FROM sj n1, sj n2 WHERE n1.a <> n2.a) q0, sl
 WHERE q0.a = 1;
 
+-- Do not forget to replace relid in bare Var join clause (bug #19435)
+ALTER TABLE sl ADD COLUMN bool_col boolean;
+EXPLAIN (COSTS OFF)
+SELECT 1 AS c1 FROM sl sl1 LEFT JOIN (sl AS sl2 NATURAL JOIN sl AS sl3)
+  ON sl2.bool_col LEFT JOIN sl AS sl4 ON sl2.bool_col;
+
 -- Check optimization disabling if it will violate special join conditions.
 -- Two identical joined relations satisfies self join removal conditions but
 -- stay in different special join infos.
@@ -3717,13 +3758,15 @@ set enable_nestloop to 0;
 set enable_hashjoin to 0;
 set enable_sort to 0;
 
+-- we need additional data to get the partial indexes to be preferred
+insert into j1 select 2, i from generate_series(1, 100) i;
+insert into j2 select 1, i from generate_series(2, 100) i;
+analyze j1;
+analyze j2;
+
 -- create indexes that will be preferred over the PKs to perform the join
 create index j1_id1_idx on j1 (id1) where id1 % 1000 = 1;
 create index j2_id1_idx on j2 (id1) where id1 % 1000 = 1;
-
--- need an additional row in j2, if we want j2_id1_idx to be preferred
-insert into j2 values(1,2);
-analyze j2;
 
 explain (costs off) select * from j1
 inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2

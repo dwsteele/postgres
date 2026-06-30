@@ -1279,7 +1279,7 @@ main(int argc, char **argv)
 	 * right now.
 	 */
 	if (plainText)
-		RestoreArchive(fout, false);
+		RestoreArchive(fout);
 
 	CloseArchive(fout);
 
@@ -4625,14 +4625,14 @@ getPublications(Archive *fout)
 		 * Get the list of tables for publications specified in the EXCEPT
 		 * TABLE clause.
 		 *
-		 * Although individual EXCEPT TABLE entries could be stored in
+		 * Although individual table entries in EXCEPT list could be stored in
 		 * PublicationRelInfo, dumpPublicationTable cannot be used to emit
 		 * them, because there is no ALTER PUBLICATION ... ADD command to add
-		 * individual table entries to the EXCEPT TABLE list.
+		 * individual table entries to the EXCEPT list.
 		 *
-		 * Therefore, the approach is to dump the complete EXCEPT TABLE list
-		 * in a single CREATE PUBLICATION statement. PublicationInfo is used
-		 * to collect this information, which is then emitted by
+		 * Therefore, the approach is to dump the complete EXCEPT list in a
+		 * single CREATE PUBLICATION statement. PublicationInfo is used to
+		 * collect this information, which is then emitted by
 		 * dumpPublication().
 		 */
 		if (fout->remoteVersion >= 190000)
@@ -4708,19 +4708,19 @@ dumpPublication(Archive *fout, const PublicationInfo *pubinfo)
 
 		appendPQExpBufferStr(query, " FOR ALL TABLES");
 
-		/* Include EXCEPT TABLE clause if there are except_tables. */
+		/* Include EXCEPT (TABLE) clause if there are except_tables. */
 		for (SimplePtrListCell *cell = pubinfo->except_tables.head; cell; cell = cell->next)
 		{
 			TableInfo  *tbinfo = (TableInfo *) cell->ptr;
 
 			if (++n_except == 1)
-				appendPQExpBufferStr(query, " EXCEPT TABLE (");
+				appendPQExpBufferStr(query, " EXCEPT (");
 			else
 				appendPQExpBufferStr(query, ", ");
-			appendPQExpBuffer(query, "ONLY %s", fmtQualifiedDumpable(tbinfo));
+			appendPQExpBuffer(query, "TABLE ONLY %s", fmtQualifiedDumpable(tbinfo));
 		}
 		if (n_except > 0)
-			appendPQExpBufferStr(query, ")");
+			appendPQExpBufferChar(query, ')');
 
 		if (pubinfo->puballsequences)
 			appendPQExpBufferStr(query, ", ALL SEQUENCES");
@@ -5272,8 +5272,7 @@ getSubscriptions(Archive *fout)
 		appendPQExpBufferStr(query,
 							 " s.submaxretention,\n");
 	else
-		appendPQExpBuffer(query,
-						  " 0 AS submaxretention,\n");
+		appendPQExpBufferStr(query, " 0 AS submaxretention,\n");
 
 	if (fout->remoteVersion >= 190000)
 		appendPQExpBufferStr(query,
@@ -5592,7 +5591,7 @@ dumpSubscription(Archive *fout, const SubscriptionInfo *subinfo)
 	}
 	else
 	{
-		appendPQExpBuffer(query, "CONNECTION ");
+		appendPQExpBufferStr(query, "CONNECTION ");
 		appendStringLiteralAH(query, subinfo->subconninfo, fout);
 	}
 
@@ -8162,8 +8161,6 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	{
 		Oid			indrelid = atooid(PQgetvalue(res, j, i_indrelid));
 		TableInfo  *tbinfo = NULL;
-		char	  **indAttNames = NULL;
-		int			nindAttNames = 0;
 		int			numinds;
 
 		/* Count rows for this table */
@@ -8197,6 +8194,8 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 		{
 			char		contype;
 			char		indexkind;
+			char	  **indAttNames = NULL;
+			int			nindAttNames = 0;
 			RelStatsInfo *relstats;
 			int32		relpages = atoi(PQgetvalue(res, j, i_relpages));
 			int32		relallvisible = atoi(PQgetvalue(res, j, i_relallvisible));
@@ -11187,7 +11186,7 @@ fetchAttributeStats(Archive *fout)
 
 		if (fout->remoteVersion >= 190000)
 		{
-			RelStatsInfo *rsinfo = (RelStatsInfo *) te->defnDumperArg;
+			const RelStatsInfo *rsinfo = (const RelStatsInfo *) te->defnDumperArg;
 			char		relid[32];
 
 			sprintf(relid, "%u", rsinfo->relid);
@@ -18862,7 +18861,7 @@ dumpStatisticsExtStats(Archive *fout, const StatsExtInfo *statsextinfo)
 		{
 			/*
 			 * There is no ordering column in pg_stats_ext_exprs.  However, we
-			 * can rely on the unnesting of pg_statistic.ext_data.stxdexpr to
+			 * can rely on the unnesting of pg_statistic_ext_data.stxdexpr to
 			 * maintain the desired order of expression elements.
 			 */
 			appendPQExpBufferStr(pq,

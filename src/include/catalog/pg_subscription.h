@@ -130,6 +130,8 @@ MAKE_SYSCACHE(SUBSCRIPTIONNAME, pg_subscription_subname_index, 4);
 
 typedef struct Subscription
 {
+	MemoryContext cxt;			/* mem cxt containing this subscription */
+
 	Oid			oid;			/* Oid of the subscription */
 	Oid			dbid;			/* Oid of the database which subscription is
 								 * in */
@@ -211,8 +213,8 @@ typedef struct Subscription
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 
 extern Subscription *GetSubscription(Oid subid, bool missing_ok,
-									 bool aclcheck);
-extern void FreeSubscription(Subscription *sub);
+									 bool conninfo_needed,
+									 bool conninfo_aclcheck);
 extern void DisableSubscription(Oid subid);
 
 extern int	CountDBSubscriptions(Oid dbid);

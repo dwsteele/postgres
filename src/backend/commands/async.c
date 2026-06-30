@@ -114,15 +114,15 @@
  *	  If the current transaction has executed any LISTEN/UNLISTEN actions,
  *	  PreCommit_Notify() prepares to commit those.  For LISTEN, it
  *	  pre-allocates entries in both the per-backend localChannelTable and the
- *	  shared globalChannelTable (with listening=false so that these entries
- *	  are no-ops for the moment).  It also records the final per-channel
- *	  intent in pendingListenActions, so post-commit/abort processing can
- *	  apply that in a single step.  Since all these allocations happen before
- *	  committing to clog, we can safely abort the transaction on failure.
+ *	  shared globalChannelTable, marking new shared entries removeOnAbort.
+ *	  It also records the final per-channel intent in pendingListenActions,
+ *	  so post-commit/abort processing can apply that in a single step.
+ *	  Since all these allocations happen before committing to clog, we can
+ *	  safely abort the transaction on failure.
  *
  *	  After commit, AtCommit_Notify() runs through pendingListenActions and
- *	  updates the backend's per-channel listening flags to activate or
- *	  deactivate listening.  This happens before sending signals.
+ *	  applies the final per-channel listen/unlisten state.  This happens
+ *	  before sending signals.
  *
  *	  SignalBackends() consults the shared global channel table to identify
  *	  listeners for the channels that the current transaction sent
@@ -179,6 +179,7 @@
 #include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/procsignal.h"
+#include "storage/subsystems.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/dsa.h"
@@ -345,6 +346,15 @@ typedef struct AsyncQueueControl
 
 static AsyncQueueControl *asyncQueueControl;
 
+static void AsyncShmemRequest(void *arg);
+static void AsyncShmemInit(void *arg);
+
+const ShmemCallbacks AsyncShmemCallbacks = {
+	.request_fn = AsyncShmemRequest,
+	.init_fn = AsyncShmemInit,
+};
+
+
 #define QUEUE_HEAD					(asyncQueueControl->head)
 #define QUEUE_TAIL					(asyncQueueControl->tail)
 #define QUEUE_STOP_PAGE				(asyncQueueControl->stopPage)
@@ -359,9 +369,13 @@ static AsyncQueueControl *asyncQueueControl;
 /*
  * The SLRU buffer area through which we access the notification queue
  */
-static SlruCtlData NotifyCtlData;
+static inline bool asyncQueuePagePrecedes(int64 p, int64 q);
+static int	asyncQueueErrdetailForIoError(const void *opaque_data);
 
-#define NotifyCtl					(&NotifyCtlData)
+static SlruDesc NotifySlruDesc;
+
+
+#define NotifyCtl					(&NotifySlruDesc)
 #define QUEUE_PAGESIZE				BLCKSZ
 
 #define QUEUE_FULL_WARN_INTERVAL	5000	/* warn at most once every 5s */
@@ -371,7 +385,7 @@ static SlruCtlData NotifyCtlData;
  *
  * This hash table maps (database OID, channel name) keys to arrays of
  * ProcNumbers representing the backends listening or about to listen
- * on each channel.  The "listening" flags allow us to create hash table
+ * on each channel.  The removeOnAbort flags allow us to create hash table
  * entries pre-commit and not have to assume that creating them post-commit
  * will succeed.
  */
@@ -386,7 +400,7 @@ typedef struct GlobalChannelKey
 typedef struct ListenerEntry
 {
 	ProcNumber	procNo;			/* listener's ProcNumber */
-	bool		listening;		/* true if committed listener */
+	bool		removeOnAbort;	/* remove entry if current xact aborts */
 } ListenerEntry;
 
 typedef struct GlobalChannelEntry
@@ -570,9 +584,7 @@ bool		Trace_notify = false;
 int			max_notify_queue_pages = 1048576;
 
 /* local function prototypes */
-static int	asyncQueueErrdetailForIoError(const void *opaque_data);
 static inline int64 asyncQueuePageDiff(int64 p, int64 q);
-static inline bool asyncQueuePagePrecedes(int64 p, int64 q);
 static inline void GlobalChannelKeyInit(GlobalChannelKey *key, Oid dboid,
 										const char *channel);
 static dshash_hash globalChannelTableHash(const void *key, size_t size,
@@ -780,78 +792,63 @@ initPendingListenActions(void)
 }
 
 /*
- * Report space needed for our shared memory area
+ * Register our shared memory needs
  */
-Size
-AsyncShmemSize(void)
+static void
+AsyncShmemRequest(void *arg)
 {
 	Size		size;
 
-	/* This had better match AsyncShmemInit */
 	size = mul_size(MaxBackends, sizeof(QueueBackendStatus));
 	size = add_size(size, offsetof(AsyncQueueControl, backend));
 
-	size = add_size(size, SimpleLruShmemSize(notify_buffers, 0));
+	ShmemRequestStruct(.name = "Async Queue Control",
+					   .size = size,
+					   .ptr = (void **) &asyncQueueControl,
+		);
 
-	return size;
+	SimpleLruRequest(.desc = &NotifySlruDesc,
+					 .name = "notify",
+					 .Dir = "pg_notify",
+
+	/* long segment names are used in order to avoid wraparound */
+					 .long_segment_names = true,
+
+					 .nslots = notify_buffers,
+
+					 .sync_handler = SYNC_HANDLER_NONE,
+					 .PagePrecedes = asyncQueuePagePrecedes,
+					 .errdetail_for_io_error = asyncQueueErrdetailForIoError,
+
+					 .buffer_tranche_id = LWTRANCHE_NOTIFY_BUFFER,
+					 .bank_tranche_id = LWTRANCHE_NOTIFY_SLRU,
+		);
 }
 
-/*
- * Initialize our shared memory area
- */
-void
-AsyncShmemInit(void)
+static void
+AsyncShmemInit(void *arg)
 {
-	bool		found;
-	Size		size;
-
-	/*
-	 * Create or attach to the AsyncQueueControl structure.
-	 */
-	size = mul_size(MaxBackends, sizeof(QueueBackendStatus));
-	size = add_size(size, offsetof(AsyncQueueControl, backend));
-
-	asyncQueueControl = (AsyncQueueControl *)
-		ShmemInitStruct("Async Queue Control", size, &found);
-
-	if (!found)
+	SET_QUEUE_POS(QUEUE_HEAD, 0, 0);
+	SET_QUEUE_POS(QUEUE_TAIL, 0, 0);
+	QUEUE_STOP_PAGE = 0;
+	QUEUE_FIRST_LISTENER = INVALID_PROC_NUMBER;
+	asyncQueueControl->lastQueueFillWarn = 0;
+	asyncQueueControl->globalChannelTableDSA = DSA_HANDLE_INVALID;
+	asyncQueueControl->globalChannelTableDSH = DSHASH_HANDLE_INVALID;
+	for (int i = 0; i < MaxBackends; i++)
 	{
-		/* First time through, so initialize it */
-		SET_QUEUE_POS(QUEUE_HEAD, 0, 0);
-		SET_QUEUE_POS(QUEUE_TAIL, 0, 0);
-		QUEUE_STOP_PAGE = 0;
-		QUEUE_FIRST_LISTENER = INVALID_PROC_NUMBER;
-		asyncQueueControl->lastQueueFillWarn = 0;
-		asyncQueueControl->globalChannelTableDSA = DSA_HANDLE_INVALID;
-		asyncQueueControl->globalChannelTableDSH = DSHASH_HANDLE_INVALID;
-		for (int i = 0; i < MaxBackends; i++)
-		{
-			QUEUE_BACKEND_PID(i) = InvalidPid;
-			QUEUE_BACKEND_DBOID(i) = InvalidOid;
-			QUEUE_NEXT_LISTENER(i) = INVALID_PROC_NUMBER;
-			SET_QUEUE_POS(QUEUE_BACKEND_POS(i), 0, 0);
-			QUEUE_BACKEND_WAKEUP_PENDING(i) = false;
-			QUEUE_BACKEND_IS_ADVANCING(i) = false;
-		}
+		QUEUE_BACKEND_PID(i) = InvalidPid;
+		QUEUE_BACKEND_DBOID(i) = InvalidOid;
+		QUEUE_NEXT_LISTENER(i) = INVALID_PROC_NUMBER;
+		SET_QUEUE_POS(QUEUE_BACKEND_POS(i), 0, 0);
+		QUEUE_BACKEND_WAKEUP_PENDING(i) = false;
+		QUEUE_BACKEND_IS_ADVANCING(i) = false;
 	}
 
 	/*
-	 * Set up SLRU management of the pg_notify data. Note that long segment
-	 * names are used in order to avoid wraparound.
+	 * During start or reboot, clean out the pg_notify directory.
 	 */
-	NotifyCtl->PagePrecedes = asyncQueuePagePrecedes;
-	NotifyCtl->errdetail_for_io_error = asyncQueueErrdetailForIoError;
-	SimpleLruInit(NotifyCtl, "notify", notify_buffers, 0,
-				  "pg_notify", LWTRANCHE_NOTIFY_BUFFER, LWTRANCHE_NOTIFY_SLRU,
-				  SYNC_HANDLER_NONE, true);
-
-	if (!found)
-	{
-		/*
-		 * During start or reboot, clean out the pg_notify directory.
-		 */
-		(void) SlruScanDirectory(NotifyCtl, SlruScanDirCbDeleteAll, NULL);
-	}
+	(void) SlruScanDirectory(NotifyCtl, SlruScanDirCbDeleteAll, NULL);
 }
 
 
@@ -1526,9 +1523,8 @@ BecomeRegisteredListener(void)
  *
  * Prepare a LISTEN by recording it in pendingListenActions, pre-allocating
  * an entry in localChannelTable, and pre-allocating an entry in the shared
- * globalChannelTable with listening=false.  The listening flag will be set
- * to true in AtCommit_Notify.  If we abort later, unwanted table entries
- * will be removed.
+ * globalChannelTable with removeOnAbort set.  AtCommit_Notify will clear
+ * removeOnAbort; abort processing will remove entries still marked so.
  */
 static void
 PrepareTableEntriesForListen(const char *channel)
@@ -1560,7 +1556,7 @@ PrepareTableEntriesForListen(const char *channel)
 	 */
 	(void) hash_search(localChannelTable, channel, HASH_ENTER, NULL);
 
-	/* Pre-allocate entry in shared globalChannelTable with listening=false */
+	/* Pre-allocate entry in shared globalChannelTable */
 	GlobalChannelKeyInit(&key, MyDatabaseId, channel);
 	entry = dshash_find_or_insert(globalChannelTable, &key, &found);
 
@@ -1595,7 +1591,7 @@ PrepareTableEntriesForListen(const char *channel)
 	{
 		if (listeners[i].procNo == MyProcNumber)
 		{
-			/* Already have an entry; listening flag stays as-is until commit */
+			/* Already have an entry; leave removeOnAbort as-is */
 			dshash_release_lock(globalChannelTable, entry);
 			return;
 		}
@@ -1618,8 +1614,7 @@ PrepareTableEntriesForListen(const char *channel)
 	}
 
 	listeners[entry->numListeners].procNo = MyProcNumber;
-	listeners[entry->numListeners].listening = false;	/* staged, not yet
-														 * committed */
+	listeners[entry->numListeners].removeOnAbort = true;
 	entry->numListeners++;
 
 	dshash_release_lock(globalChannelTable, entry);
@@ -1769,11 +1764,11 @@ ApplyPendingListenActions(bool isCommit)
 					if (pending->action == PENDING_LISTEN)
 					{
 						/*
-						 * LISTEN being committed: set listening=true.
+						 * LISTEN being committed: entry is now permanent.
 						 * localChannelTable entry was created during
 						 * PreCommit and should be kept.
 						 */
-						listeners[i].listening = true;
+						listeners[i].removeOnAbort = false;
 						removeLocal = false;
 					}
 					else
@@ -1793,20 +1788,19 @@ ApplyPendingListenActions(bool isCommit)
 					 * pendingListenActions entries, so it's pretty hard to
 					 * test.
 					 */
-					if (!listeners[i].listening)
+					if (listeners[i].removeOnAbort)
 					{
 						/*
 						 * Staged LISTEN (or LISTEN+UNLISTEN) being aborted,
-						 * and we weren't listening before, so remove
-						 * pre-allocated entries from both tables.
+						 * so remove pre-allocated entries from both tables.
 						 */
 						RemoveListenerFromChannel(&entry, listeners, i);
 					}
 					else
 					{
 						/*
-						 * We're aborting, but the previous state was that
-						 * we're listening, so keep localChannelTable entry.
+						 * Entry predates this transaction, so keep the
+						 * localChannelTable entry.
 						 */
 						removeLocal = false;
 					}
@@ -2300,17 +2294,22 @@ SignalBackends(void)
 		listeners = (ListenerEntry *) dsa_get_address(globalChannelDSA,
 													  entry->listenersArray);
 
-		/* Identify listeners that now need waking, add them to arrays */
+		/*
+		 * Identify listeners that now need waking, add them to arrays.
+		 *
+		 * Note that we signal listeners regardless of the state of their
+		 * removeOnAbort flags.  Hence a new listener that reached PreCommit,
+		 * but then failed before AtCommit_Notify, can receive a signal even
+		 * though it was never really listening.  This is okay because it will
+		 * not do anything in response to that signal.  If we did not do it
+		 * like this then a new listener might miss some messages due to the
+		 * direct-advance logic below.
+		 */
 		for (int j = 0; j < entry->numListeners; j++)
 		{
-			ProcNumber	i;
+			ProcNumber	i = listeners[j].procNo;
 			int32		pid;
 			QueuePosition pos;
-
-			if (!listeners[j].listening)
-				continue;		/* ignore not-yet-committed listeners */
-
-			i = listeners[j].procNo;
 
 			if (QUEUE_BACKEND_WAKEUP_PENDING(i))
 				continue;		/* already signaled, no need to repeat */
@@ -2560,8 +2559,7 @@ HandleNotifyInterrupt(void)
 	/* signal that work needs to be done */
 	notifyInterruptPending = true;
 
-	/* make sure the event is processed in due course */
-	SetLatch(MyLatch);
+	/* latch will be set by procsignal_sigusr1_handler */
 }
 
 /*

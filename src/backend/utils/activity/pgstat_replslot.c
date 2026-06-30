@@ -188,7 +188,7 @@ pgstat_drop_replslot(ReplicationSlot *slot)
 	Assert(LWLockHeldByMeInMode(ReplicationSlotAllocationLock, LW_EXCLUSIVE));
 
 	if (!pgstat_drop_entry(PGSTAT_KIND_REPLSLOT, InvalidOid,
-						   ReplicationSlotIndex(slot)))
+						   ReplicationSlotIndex(slot), false))
 		pgstat_request_entry_refs_gc();
 }
 
@@ -208,7 +208,8 @@ pgstat_fetch_replslot(NameData slotname)
 
 	if (idx != -1)
 		slotentry = (PgStat_StatReplSlotEntry *) pgstat_fetch_entry(PGSTAT_KIND_REPLSLOT,
-																	InvalidOid, idx);
+																	InvalidOid, idx,
+																	NULL);
 
 	LWLockRelease(ReplicationSlotControlLock);
 
