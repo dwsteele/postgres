@@ -162,7 +162,6 @@ pg_backup_stop(PG_FUNCTION_ARGS)
 	bool		waitforarchive = PG_GETARG_BOOL(0);
 	char	   *backup_label;
 	bytea	   *pg_control_bytea;
-	uint8		pg_control[PG_CONTROL_FILE_SIZE];
 	SessionBackupState status = get_backup_status();
 
 	/* Initialize attributes information in the tuple descriptor */
@@ -178,12 +177,10 @@ pg_backup_stop(PG_FUNCTION_ARGS)
 	Assert(backup_state != NULL);
 	Assert(tablespace_map != NULL);
 
-	/* Build the contents of pg_control */
-	backup_control_file(pg_control);
-
+	/* Build the contents of pg_control directly into the bytea payload */
 	pg_control_bytea = (bytea *) palloc(PG_CONTROL_FILE_SIZE + VARHDRSZ);
 	SET_VARSIZE(pg_control_bytea, PG_CONTROL_FILE_SIZE + VARHDRSZ);
-	memcpy(VARDATA(pg_control_bytea), pg_control, PG_CONTROL_FILE_SIZE);
+	backup_control_file((uint8 *) VARDATA(pg_control_bytea));
 
 	/* Stop the backup */
 	do_pg_backup_stop(backup_state, waitforarchive);
