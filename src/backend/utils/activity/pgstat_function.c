@@ -113,7 +113,7 @@ pgstat_init_function_usage(FunctionCallInfo fcinfo,
 		if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(fcinfo->flinfo->fn_oid)))
 		{
 			pgstat_drop_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId,
-							  fcinfo->flinfo->fn_oid);
+							  fcinfo->flinfo->fn_oid, true);
 			ereport(ERROR, errcode(ERRCODE_UNDEFINED_FUNCTION),
 					errmsg("function call to dropped function"));
 		}
@@ -245,5 +245,5 @@ PgStat_StatFuncEntry *
 pgstat_fetch_stat_funcentry(Oid func_id)
 {
 	return (PgStat_StatFuncEntry *)
-		pgstat_fetch_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId, func_id);
+		pgstat_fetch_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId, func_id, NULL);
 }

@@ -1443,9 +1443,10 @@ print_aligned_vertical(const printTableContent *cont,
 	}
 
 	/*
-	 * Calculate available width for data in wrapped mode
+	 * Determine data column width: fit output width in wrapped mode, or
+	 * ensure alignment with the record header line in aligned mode.
 	 */
-	if (cont->opt->format == PRINT_WRAPPED)
+	if (cont->opt->format == PRINT_WRAPPED || cont->opt->format == PRINT_ALIGNED)
 	{
 		unsigned int swidth,
 					rwidth = 0,
@@ -1517,7 +1518,7 @@ print_aligned_vertical(const printTableContent *cont,
 			if (width < rwidth)
 				width = rwidth;
 
-			if (output_columns > 0)
+			if (cont->opt->format == PRINT_WRAPPED && output_columns > 0)
 			{
 				unsigned int min_width;
 
@@ -3024,7 +3025,7 @@ void
 disable_sigpipe_trap(void)
 {
 #ifndef WIN32
-	pqsignal(SIGPIPE, SIG_IGN);
+	pqsignal(SIGPIPE, PG_SIG_IGN);
 #endif
 }
 
@@ -3047,7 +3048,7 @@ void
 restore_sigpipe_trap(void)
 {
 #ifndef WIN32
-	pqsignal(SIGPIPE, always_ignore_sigpipe ? SIG_IGN : SIG_DFL);
+	pqsignal(SIGPIPE, always_ignore_sigpipe ? PG_SIG_IGN : PG_SIG_DFL);
 #endif
 }
 

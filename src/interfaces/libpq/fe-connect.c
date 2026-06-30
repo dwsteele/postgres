@@ -413,6 +413,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"OAuth-Scope", "", 15,
 	offsetof(struct pg_conn, oauth_scope)},
 
+	{"oauth_ca_file", "PGOAUTHCAFILE", NULL, NULL,
+		"OAuth-CA-File", "", 64,
+	offsetof(struct pg_conn, oauth_ca_file)},
+
 	{"sslkeylogfile", NULL, NULL, NULL,
 		"SSL-Key-Log-File", "D", 64,
 	offsetof(struct pg_conn, sslkeylogfile)},
@@ -5158,6 +5162,7 @@ freePGconn(PGconn *conn)
 	free(conn->oauth_discovery_uri);
 	free(conn->oauth_client_id);
 	free(conn->oauth_client_secret);
+	free(conn->oauth_ca_file);
 	free(conn->oauth_scope);
 	/* Note that conn->Pfdebug is not ours to close or free */
 	free(conn->events);
@@ -6044,6 +6049,18 @@ next_file:
 	status = parseServiceFile(serviceFile, service, options, errorMessage, &group_found);
 	if (status != 0)
 		return status;
+
+	/* Update servicefile to the file that actually supplied the service */
+	if (group_found && service_fname != NULL &&
+		conninfo_storeval(options, "servicefile", serviceFile,
+						  errorMessage, false, false) == NULL)
+	{
+		/*
+		 * conninfo_storeval already set an error message, that could be only
+		 * an OOM.
+		 */
+		return 3;
+	}
 
 last_file:
 	if (!group_found)
