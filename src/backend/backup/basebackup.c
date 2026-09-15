@@ -368,7 +368,7 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 				/* ... and pg_control after everything else. */
 				backup_control_file(controlFile);
 				sendFileWithContent(sink, XLOG_CONTROL_FILE,
-									(char *)controlFile, PG_CONTROL_FILE_SIZE,
+									(char *) controlFile, PG_CONTROL_FILE_SIZE,
 									&manifest);
 			}
 			else
