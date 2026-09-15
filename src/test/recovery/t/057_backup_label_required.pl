@@ -38,6 +38,13 @@ sub check_startup_without_backup_label
 
 my $node_primary = PostgreSQL::Test::Cluster->new('primary');
 $node_primary->init(allows_streaming => 1);
+
+# Set wal_keep_size to prevent WAL segment recycling after the checkpoints
+# enforced by the backups below.  The standby is created from the first backup
+# but started only after later backups have advanced the primary, so it must
+# still be able to stream the segments in between.  This is set before the
+# first backup so that it is inherited by the standbys.
+$node_primary->append_conf('postgresql.conf', 'wal_keep_size = 64MB');
 $node_primary->start;
 
 $node_primary->safe_psql('postgres',
