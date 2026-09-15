@@ -66,7 +66,7 @@ is( $node_primary->safe_psql(
 	'pg_control_recovery() reports the flag not set on the source cluster');
 
 # pg_resetwal is the only supported way to clear the flag without recovering.
-# Use a copy so the original backupis left intact for the restore tests below.
+# Use a copy so the original backup is left intact for the restore tests below.
 my $reset_dir = $node_primary->backup_dir . '/' . $backup_name . '_reset';
 PostgreSQL::Test::RecursiveCopy::copypath(
 	$node_primary->backup_dir . '/' . $backup_name, $reset_dir);
@@ -100,6 +100,30 @@ command_like(
 	[ 'pg_controldata', '--pgdata' => $node_restored->data_dir ],
 	qr/Backup label required: +no/,
 	'control file no longer requires backup_label after recovery');
+
+# A backup made without WAL cannot reach a consistent state on its own, and
+# recovery reports that it could not locate the checkpoint record.  Since
+# pg_control requires backup_label, the hint for that error must not repeat the
+# usual advice to remove the file.
+my $nowal_backup = 'backup_nowal';
+$node_primary->backup($nowal_backup,
+	backup_options => [ '--wal-method' => 'none' ]);
+
+my $node_nowal = PostgreSQL::Test::Cluster->new('nowal');
+$node_nowal->init_from_backup($node_primary, $nowal_backup);
+
+my $nowal_offset = -s $node_nowal->logfile;
+is($node_nowal->start(fail_ok => 1), 0,
+	'backup without WAL fails to start when no recovery options are set');
+ok( $node_nowal->log_contains(
+		'FATAL: .*could not locate required checkpoint record', $nowal_offset),
+	'missing checkpoint record is reported');
+ok( $node_nowal->log_contains('HINT: .*recovery\.signal', $nowal_offset),
+	'hint points at the recovery signal files');
+ok( $node_nowal->log_contains('Do not remove .*backup_label', $nowal_offset),
+	'hint tells the user to keep backup_label');
+ok( !$node_nowal->log_contains('try removing the file', $nowal_offset),
+	'hint does not suggest removing backup_label');
 
 # A backup taken from a standby gets the same treatment.  This is the case that
 # previously required backup software to copy pg_control last.

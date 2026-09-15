@@ -604,6 +604,10 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 					ereport(FATAL,
 							errmsg("could not find redo location %X/%08X referenced by checkpoint record at %X/%08X",
 								   LSN_FORMAT_ARGS(checkPoint.redo), LSN_FORMAT_ARGS(CheckPointLoc)),
+							ControlFile->backupLabelRequired ?
+							errhint("Touch \"%s/recovery.signal\" or \"%s/standby.signal\" and add required recovery options.\n"
+									"Do not remove \"%s/backup_label\"; it is required to recover this backup.",
+									DataDir, DataDir, DataDir) :
 							errhint("If you are restoring from a backup, touch \"%s/recovery.signal\" or \"%s/standby.signal\" and add required recovery options.\n"
 									"If you are not restoring from a backup, try removing the file \"%s/backup_label\".\n"
 									"Be careful: removing \"%s/backup_label\" will result in a corrupt cluster if restoring from a backup.",
@@ -615,6 +619,10 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 			ereport(FATAL,
 					errmsg("could not locate required checkpoint record at %X/%08X",
 						   LSN_FORMAT_ARGS(CheckPointLoc)),
+					ControlFile->backupLabelRequired ?
+					errhint("Touch \"%s/recovery.signal\" or \"%s/standby.signal\" and add required recovery options.\n"
+							"Do not remove \"%s/backup_label\"; it is required to recover this backup.",
+							DataDir, DataDir, DataDir) :
 					errhint("If you are restoring from a backup, touch \"%s/recovery.signal\" or \"%s/standby.signal\" and add required recovery options.\n"
 							"If you are not restoring from a backup, try removing the file \"%s/backup_label\".\n"
 							"Be careful: removing \"%s/backup_label\" will result in a corrupt cluster if restoring from a backup.",
