@@ -10593,9 +10593,12 @@ do_pg_abort_backup(int code, Datum arg)
  * Create a consistent copy of control data to be used for backup and update it
  * to require a backup label for recovery. Also recalculate the CRC.
  *
+ * The caller's buffer must be at least PG_CONTROL_FILE_SIZE bytes and is
+ * zero-padded to that size.
+ *
  * All field access is done through a local, properly-aligned ControlFileData;
  * the caller's buffer is only ever written via memcpy() and so need not be
- * aligned for ControlFileData (e.g. it may point into the payload of a bytea).
+ * suitably aligned for ControlFileData.
  */
 void
 backup_control_file(uint8 *controlFile)

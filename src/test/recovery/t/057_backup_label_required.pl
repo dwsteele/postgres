@@ -10,6 +10,7 @@
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::RecursiveCopy;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -62,7 +63,21 @@ command_like(
 is( $node_primary->safe_psql(
 		'postgres', 'SELECT backup_label_required FROM pg_control_recovery()'),
 	'f',
-	'pg_control_recovery() reports the flag');
+	'pg_control_recovery() reports the flag not set on the source cluster');
+
+# pg_resetwal is the only supported way to clear the flag without recovering.
+# Use a copy so the original backupis left intact for the restore tests below.
+my $reset_dir = $node_primary->backup_dir . '/' . $backup_name . '_reset';
+PostgreSQL::Test::RecursiveCopy::copypath(
+	$node_primary->backup_dir . '/' . $backup_name, $reset_dir);
+chmod(0700, $reset_dir) or BAIL_OUT("could not chmod $reset_dir");
+
+command_ok([ 'pg_resetwal', '--force', '--pgdata' => $reset_dir ],
+	'pg_resetwal runs on a backup that requires backup_label');
+command_like(
+	[ 'pg_controldata', '--pgdata' => $reset_dir ],
+	qr/Backup label required: +no/,
+	'pg_resetwal clears the flag');
 
 # Restoring that backup without backup_label must not start.
 my $node_restored = PostgreSQL::Test::Cluster->new('restored');
