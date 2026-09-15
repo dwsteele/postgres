@@ -94,9 +94,9 @@
  *
  * If processing is started in an online cluster then all backends are in Bd.
  * If processing was halted by the cluster shutting down (due to a crash or
- * intentional restart), the controlfile state "inprogress-on" will be observed
- * on system startup and all backends will be placed in Bd. The controlfile
- * state will also be set to "off".
+ * intentional restart), the control file state "inprogress-on" will be
+ * observed on system startup and all backends will be placed in Bd. The
+ * control file state will also be set to "off".
  *
  * Backends transition Bd -> Bi via a procsignalbarrier which is emitted by the
  * DataChecksumsWorkerLauncherMain.  When all backends have acknowledged the
@@ -146,7 +146,25 @@
  * stop writing data checksums as no backend is enforcing data checksum
  * validation any longer.
  *
- * 4. Future opportunities for optimizations
+ * 4. Interaction with offline data checksum changes
+ * -------------------------------------------------
+ * Enabling or disabling checksums offline with pg_checksums uses none of the
+ * machinery in this file, but the two mechanisms share the state kept in the
+ * control file, so their interaction is documented here.
+ *
+ * pg_checksums writes the new state to the control file and sets
+ * data_checksum_is_local, marking a state that no WAL record accounts for.
+ * Recovery then does not adopt the state carried by a replayed checkpoint
+ * record over it.  The control file also carries a watermark, the WAL
+ * position through which data checksum transitions are covered.  Replay skips
+ * transition records ending at or below the watermark, as their effect is
+ * already contained in the control file, and applies records above it as
+ * usual, whether they were written before or after an offline change.  This
+ * is why an offline change in a replicated setup must be made on every node
+ * while all of them are stopped and caught up; see the pg_checksums
+ * documentation for the procedure.
+ *
+ * 5. Future opportunities for optimizations
  * -----------------------------------------
  * Below are some potential optimizations and improvements which were brought
  * up during reviews of this feature, but which weren't implemented in the
@@ -383,16 +401,24 @@ static DataChecksumsWorkerOperation operation;
 static void StartDataChecksumsWorkerLauncher(DataChecksumsWorkerOperation op,
 											 int cost_delay,
 											 int cost_limit);
+static void ErrorOnInvalidDatabases(void);
+static bool ProcessSingleRelationFork(Relation reln, ForkNumber forkNum, BufferAccessStrategy strategy);
+static void ResetDataChecksumsProgressCounters(void);
+static bool ProcessSingleRelationByOid(Oid relationId, BufferAccessStrategy strategy);
+static BgwHandleStatus WaitForDataChecksumsWorkerState(BackgroundWorkerHandle *handle,
+													   bool wait_for_startup,
+													   pid_t *pidp,
+													   uint32 wait_event);
+static DataChecksumsWorkerResult ProcessDatabase(DataChecksumsWorkerDatabase *db);
+static void launcher_exit(int code, Datum arg);
+static void launcher_cancel_handler(SIGNAL_ARGS);
+static void WaitForAllTransactionsToFinish(void);
+static bool ProcessAllDatabases(void);
 static void DataChecksumsShmemRequest(void *arg);
 static bool DatabaseExists(Oid dboid);
 static List *BuildDatabaseList(void);
-static List *BuildRelationList(bool temp_relations, bool include_shared);
 static void FreeDatabaseList(List *dblist);
-static DataChecksumsWorkerResult ProcessDatabase(DataChecksumsWorkerDatabase *db);
-static bool ProcessAllDatabases(void);
-static bool ProcessSingleRelationFork(Relation reln, ForkNumber forkNum, BufferAccessStrategy strategy);
-static void launcher_cancel_handler(SIGNAL_ARGS);
-static void WaitForAllTransactionsToFinish(void);
+static List *BuildRelationList(bool temp_relations, bool include_shared);
 
 const ShmemCallbacks DataChecksumsShmemCallbacks = {
 	.request_fn = DataChecksumsShmemRequest,
@@ -490,7 +516,7 @@ AbsorbDataChecksumsBarrier(ProcSignalBarrierType barrier)
 			target_state = PG_DATA_CHECKSUM_OFF;
 			break;
 		default:
-			elog(ERROR, "incorrect barrier \"%i\" received", barrier);
+			elog(ERROR, "incorrect barrier \"%d\" received", barrier);
 	}
 
 	/*
@@ -515,7 +541,7 @@ AbsorbDataChecksumsBarrier(ProcSignalBarrierType barrier)
 	 * a condition would be a grave programmer error as the states are a
 	 * discrete set.
 	 */
-	for (int i = 0; i < lengthof(checksum_barriers) && !found; i++)
+	for (size_t i = 0; i < lengthof(checksum_barriers) && !found; i++)
 	{
 		if (checksum_barriers[i].from == current && checksum_barriers[i].to == target_state)
 			found = true;
@@ -528,7 +554,7 @@ AbsorbDataChecksumsBarrier(ProcSignalBarrierType barrier)
 	if (!found)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("incorrect data checksum state %i for target state %i",
+				errmsg("incorrect data checksum state %d for target state %d",
 					   current, target_state));
 
 	SetLocalDataChecksumState(target_state);
@@ -581,6 +607,17 @@ enable_data_checksums(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("cost limit must be greater than zero"));
+
+	/*
+	 * An invalid database cannot be connected to, so the worker would fail to
+	 * process it, and unlike a dropped database its files stay around.  Error
+	 * out early with a hint rather than failing halfway through processing. A
+	 * database which turns invalid after this check, for example from an
+	 * interrupted DROP DATABASE, instead makes its worker fail; the launcher
+	 * then aborts and leaves checksums disabled, since the invalid database's
+	 * files would otherwise be left without valid checksums.
+	 */
+	ErrorOnInvalidDatabases();
 
 	StartDataChecksumsWorkerLauncher(ENABLE_DATACHECKSUMS, cost_delay, cost_limit);
 
@@ -698,7 +735,19 @@ ProcessSingleRelationFork(Relation reln, ForkNumber forkNum, BufferAccessStrateg
 	snprintf(activity, sizeof(activity) - 1, "processing: %s.%s (%s, %u blocks)",
 			 (relns ? relns : ""), RelationGetRelationName(reln), forkNames[forkNum], numblocks);
 	pgstat_report_activity(STATE_RUNNING, activity);
-	pgstat_progress_update_param(PROGRESS_DATACHECKSUMS_BLOCKS_TOTAL, numblocks);
+	{
+		const int	index[] = {
+			PROGRESS_DATACHECKSUMS_BLOCKS_TOTAL,
+			PROGRESS_DATACHECKSUMS_BLOCKS_DONE
+		};
+
+		int64		vals[2];
+
+		vals[0] = numblocks;
+		vals[1] = 0;
+
+		pgstat_progress_update_multi_param(2, index, vals);
+	}
 	if (relns)
 		pfree(relns);
 
@@ -765,6 +814,29 @@ ProcessSingleRelationFork(Relation reln, ForkNumber forkNum, BufferAccessStrateg
 }
 
 /*
+ * Initialize all data checksum progress counters to be displayed as NULL.
+ */
+static void
+ResetDataChecksumsProgressCounters(void)
+{
+	const int	index[] = {
+		PROGRESS_DATACHECKSUMS_DBS_TOTAL,
+		PROGRESS_DATACHECKSUMS_DBS_DONE,
+		PROGRESS_DATACHECKSUMS_RELS_TOTAL,
+		PROGRESS_DATACHECKSUMS_RELS_DONE,
+		PROGRESS_DATACHECKSUMS_BLOCKS_TOTAL,
+		PROGRESS_DATACHECKSUMS_BLOCKS_DONE,
+	};
+
+	int64		vals[lengthof(index)];
+
+	for (size_t i = 0; i < lengthof(index); i++)
+		vals[i] = -1;
+
+	pgstat_progress_update_multi_param(lengthof(index), index, vals);
+}
+
+/*
  * ProcessSingleRelationByOid
  *		Process a single relation based on oid.
  *
@@ -793,11 +865,10 @@ ProcessSingleRelationByOid(Oid relationId, BufferAccessStrategy strategy)
 		pgstat_report_activity(STATE_IDLE, NULL);
 		return true;
 	}
-	RelationGetSmgr(rel);
 
 	for (ForkNumber fnum = 0; fnum <= MAX_FORKNUM; fnum++)
 	{
-		if (smgrexists(rel->rd_smgr, fnum))
+		if (smgrexists(RelationGetSmgr(rel), fnum))
 		{
 			if (!ProcessSingleRelationFork(rel, fnum, strategy))
 			{
@@ -812,6 +883,73 @@ ProcessSingleRelationByOid(Oid relationId, BufferAccessStrategy strategy)
 	pgstat_report_activity(STATE_IDLE, NULL);
 
 	return !aborted;
+}
+
+/*
+ * WaitForDataChecksumsWorkerState
+ *		Wait for a data checksums worker to start or stop.
+ *
+ * This is like WaitForBackgroundWorkerStartup() and
+ * WaitForBackgroundWorkerShutdown(), except that it also reacts to SIGINT
+ * received by the launcher.  The launcher owns the overall checksum
+ * operation, so canceling it should stop the worker it has registered or is
+ * currently running.
+ *
+ * If wait_for_startup is true, wait until the worker is no longer in
+ * BGWH_NOT_YET_STARTED state, like WaitForBackgroundWorkerStartup().  If it
+ * is false, wait until the worker reaches BGWH_STOPPED state, like
+ * WaitForBackgroundWorkerShutdown().
+ *
+ * pidp is set to the worker's PID when startup succeeds, if it is not NULL.
+ */
+static BgwHandleStatus
+WaitForDataChecksumsWorkerState(BackgroundWorkerHandle *handle,
+								bool wait_for_startup,
+								pid_t *pidp,
+								uint32 wait_event)
+{
+	BgwHandleStatus status;
+	bool		termination_requested = false;
+
+	for (;;)
+	{
+		int			rc;
+		pid_t		pid;
+
+		CHECK_FOR_INTERRUPTS();
+
+		status = GetBackgroundWorkerPid(handle, &pid);
+		if (status == BGWH_STARTED && pidp)
+			*pidp = pid;
+
+		if (abort_requested && !termination_requested)
+		{
+			TerminateBackgroundWorker(handle);
+			termination_requested = true;
+		}
+
+		/*
+		 * Startup waits for the worker to leave BGWH_NOT_YET_STARTED, while
+		 * shutdown waits for it to reach BGWH_STOPPED.
+		 */
+		if (status == BGWH_STOPPED ||
+			(wait_for_startup && status == BGWH_STARTED))
+			break;
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_POSTMASTER_DEATH, 0,
+					   wait_event);
+
+		if (rc & WL_POSTMASTER_DEATH)
+		{
+			status = BGWH_POSTMASTER_DIED;
+			break;
+		}
+
+		ResetLatch(MyLatch);
+	}
+
+	return status;
 }
 
 /*
@@ -874,9 +1012,20 @@ ProcessDatabase(DataChecksumsWorkerDatabase *db)
 		return DATACHECKSUMSWORKER_FAILED;
 	}
 
-	status = WaitForBackgroundWorkerStartup(bgw_handle, &pid);
+	/*
+	 * While this expects to wait for BGWORKER_STARTUP it may return _STOPPED
+	 * if the worker was terminated in the meantime so we must check status.
+	 */
+	status = WaitForDataChecksumsWorkerState(bgw_handle, true, &pid,
+											 WAIT_EVENT_BGWORKER_STARTUP);
 	if (status == BGWH_STOPPED)
 	{
+		if (abort_requested)
+		{
+			result = DATACHECKSUMSWORKER_ABORTED;
+			goto done;
+		}
+
 		/*
 		 * If the worker managed to start, and stop, before we got to waiting
 		 * for it we can see a STOPPED status here without it being a failure.
@@ -934,7 +1083,8 @@ ProcessDatabase(DataChecksumsWorkerDatabase *db)
 			 "Waiting for worker in database %s (pid %ld)", db->dbname, (long) pid);
 	pgstat_report_activity(STATE_RUNNING, activity);
 
-	status = WaitForBackgroundWorkerShutdown(bgw_handle);
+	status = WaitForDataChecksumsWorkerState(bgw_handle, false, NULL,
+											 WAIT_EVENT_BGWORKER_SHUTDOWN);
 	if (status == BGWH_POSTMASTER_DIED)
 		ereport(FATAL,
 				errcode(ERRCODE_ADMIN_SHUTDOWN),
@@ -948,6 +1098,20 @@ ProcessDatabase(DataChecksumsWorkerDatabase *db)
 	DataChecksumState->worker_pid = InvalidPid;
 	LWLockRelease(DataChecksumsWorkerLock);
 
+	/*
+	 * A worker which started but failed before reporting a result has most
+	 * likely FATALed in InitPostgres.  If the database was dropped after we
+	 * built the database list then that is the expected outcome and not an
+	 * error, so apply the same heuristic as when the worker failed to start.
+	 */
+	if (result == DATACHECKSUMSWORKER_FAILED && !DatabaseExists(db->dboid))
+		result = DATACHECKSUMSWORKER_DROPDB;
+
+	CHECK_FOR_LAUNCHER_ABORT_REQUEST();
+	if (abort_requested)
+		result = DATACHECKSUMSWORKER_ABORTED;
+
+done:
 	if (result == DATACHECKSUMSWORKER_ABORTED)
 		ereport(LOG,
 				errmsg("data checksums processing was aborted in database \"%s\"",
@@ -992,17 +1156,18 @@ launcher_exit(int code, Datum arg)
 		SetDataChecksumsOff();
 
 	LWLockAcquire(DataChecksumsWorkerLock, LW_EXCLUSIVE);
+	if (launcher_running)
+		DataChecksumState->launcher_running = false;
 	launcher_running = false;
-	DataChecksumState->launcher_running = false;
 	LWLockRelease(DataChecksumsWorkerLock);
 }
 
 /*
  * launcher_cancel_handler
  *
- * Internal routine for reacting to SIGINT and flagging the worker to abort.
- * The worker won't be interrupted immediately but will check for abort flag
- * between each block in a relation.
+ * Internal routine for reacting to SIGINT and flagging the launcher to abort.
+ * If a worker is registered or running, the launcher will request worker
+ * termination from its normal control flow.
  */
 static void
 launcher_cancel_handler(SIGNAL_ARGS)
@@ -1012,10 +1177,8 @@ launcher_cancel_handler(SIGNAL_ARGS)
 	abort_requested = true;
 
 	/*
-	 * There is no sleeping in the main loop, the flag will be checked
-	 * periodically in ProcessSingleRelationFork. The worker does however
-	 * sleep when waiting for concurrent transactions to end so we still need
-	 * to set the latch.
+	 * Wake the launcher if it is waiting for transactions to finish or for a
+	 * worker to start up or shut down.
 	 */
 	SetLatch(MyLatch);
 
@@ -1142,6 +1305,7 @@ again:
 
 	pgstat_progress_start_command(PROGRESS_COMMAND_DATACHECKSUMS,
 								  InvalidOid);
+	ResetDataChecksumsProgressCounters();
 
 	if (operation == ENABLE_DATACHECKSUMS)
 	{
@@ -1169,8 +1333,9 @@ again:
 		if (!ProcessAllDatabases())
 		{
 			/*
-			 * If the target state changed during processing then it's not a
-			 * failure, so restart processing instead.
+			 * If processing was canceled, or the target state changed during
+			 * processing, then it's not a failure. In the latter case, the
+			 * launcher will restart processing with the new target state.
 			 */
 			CHECK_FOR_LAUNCHER_ABORT_REQUEST();
 			if (abort_requested)
@@ -1224,6 +1389,13 @@ done:
 		operation = DataChecksumState->launch_operation;
 		DataChecksumState->cost_delay = DataChecksumState->launch_cost_delay;
 		DataChecksumState->cost_limit = DataChecksumState->launch_cost_limit;
+
+		/*
+		 * If the user started, but aborted processing, and then changed their
+		 * mind again before we had time to exit we need to clear the abort
+		 * flag.
+		 */
+		abort_requested = false;
 		LWLockRelease(DataChecksumsWorkerLock);
 		goto again;
 	}
@@ -1257,6 +1429,8 @@ ProcessAllDatabases(void)
 
 	/* Get a list of all databases to process */
 	WaitForAllTransactionsToFinish();
+	if (abort_requested)
+		return false;
 	DatabaseList = BuildDatabaseList();
 
 	/*
@@ -1269,23 +1443,14 @@ ProcessAllDatabases(void)
 		const int	index[] = {
 			PROGRESS_DATACHECKSUMS_DBS_TOTAL,
 			PROGRESS_DATACHECKSUMS_DBS_DONE,
-			PROGRESS_DATACHECKSUMS_RELS_TOTAL,
-			PROGRESS_DATACHECKSUMS_RELS_DONE,
-			PROGRESS_DATACHECKSUMS_BLOCKS_TOTAL,
-			PROGRESS_DATACHECKSUMS_BLOCKS_DONE,
 		};
 
-		int64		vals[6];
+		int64		vals[2];
 
 		vals[0] = list_length(DatabaseList);
 		vals[1] = 0;
-		/* translated to NULL */
-		vals[2] = -1;
-		vals[3] = -1;
-		vals[4] = -1;
-		vals[5] = -1;
 
-		pgstat_progress_update_multi_param(6, index, vals);
+		pgstat_progress_update_multi_param(2, index, vals);
 	}
 
 	foreach_ptr(DataChecksumsWorkerDatabase, db, DatabaseList)
@@ -1322,7 +1487,16 @@ ProcessAllDatabases(void)
 		else if (result == DATACHECKSUMSWORKER_ABORTED || abort_requested)
 		{
 			/* Abort flag set, so exit the whole process */
+			FreeDatabaseList(DatabaseList);
 			return false;
+		}
+		else if (result == DATACHECKSUMSWORKER_DROPDB)
+		{
+			/*
+			 * Ignore databases that were dropped before their worker could
+			 * process them, and continue with the remaining databases.
+			 */
+			continue;
 		}
 
 		/*
@@ -1358,9 +1532,9 @@ DataChecksumsShmemRequest(void *arg)
  * DatabaseExists
  *
  * Scans the system catalog to check if a database with the given Oid exists
- * and returns true if it is found and valid, else false. Note, we cannot use
- * database_is_invalid_oid here as it will ERROR out, and we want to gracefully
- * handle errors.
+ * and returns true if it is found, even if it is marked invalid.  An invalid
+ * database still has files that need checksums, so only a missing catalog row
+ * proves that a concurrent DROP DATABASE completed.
  */
 static bool
 DatabaseExists(Oid dboid)
@@ -1370,9 +1544,17 @@ DatabaseExists(Oid dboid)
 	SysScanDesc scan;
 	bool		found;
 	HeapTuple	tuple;
-	Form_pg_database pg_database_tuple;
 
 	StartTransactionCommand();
+
+	/*
+	 * DROP DATABASE holds an exclusive lock on the database from before it
+	 * terminates the connections to it until it commits, so take a lock which
+	 * conflicts with it to wait out a drop which is in flight.  Without this
+	 * we can see a database whose worker was just killed by DROP DATABASE ...
+	 * WITH (FORCE) as still existing, and report a spurious failure.
+	 */
+	LockSharedObject(DatabaseRelationId, dboid, 0, AccessShareLock);
 
 	rel = table_open(DatabaseRelationId, AccessShareLock);
 	ScanKeyInit(&skey,
@@ -1384,20 +1566,53 @@ DatabaseExists(Oid dboid)
 	tuple = systable_getnext(scan);
 	found = HeapTupleIsValid(tuple);
 
-	/* If the Oid exists, ensure that it's not partially dropped */
-	if (found)
-	{
-		pg_database_tuple = (Form_pg_database) GETSTRUCT(tuple);
-		if (database_is_invalid_form(pg_database_tuple))
-			found = false;
-	}
-
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 
 	CommitTransactionCommand();
 
 	return found;
+}
+
+/*
+ * ErrorOnInvalidDatabases
+ *		Error out if the cluster contains an invalid database
+ *
+ * A database left invalid by an interrupted DROP DATABASE cannot be connected
+ * to, so data checksums can never be enabled in it, while its files remain on
+ * disk where checksum verification will find them.  Report it to the caller
+ * so the user can drop it before retrying.  Called from a normal backend, so
+ * unlike DatabaseExists we are already in a transaction.
+ *
+ * A cluster can contain more than one invalid database, but only the first one
+ * found is reported; collecting them all is not worth the complexity here.  A
+ * user with several of them gets the error again for the next one after
+ * dropping the reported database, which the hint accounts for.
+ */
+static void
+ErrorOnInvalidDatabases(void)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+
+	rel = table_open(DatabaseRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+
+	while (HeapTupleIsValid(tup = heap_getnext(scan, ForwardScanDirection)))
+	{
+		Form_pg_database pgdb = (Form_pg_database) GETSTRUCT(tup);
+
+		if (database_is_invalid_form(pgdb))
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("cannot enable data checksums in a cluster with invalid database \"%s\"",
+						   NameStr(pgdb->datname)),
+					errhint("Use DROP DATABASE to drop invalid databases."));
+	}
+
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
 }
 
 /*
@@ -1431,7 +1646,7 @@ BuildDatabaseList(void)
 
 		oldctx = MemoryContextSwitchTo(ctx);
 
-		db = (DataChecksumsWorkerDatabase *) palloc0(sizeof(DataChecksumsWorkerDatabase));
+		db = palloc0_object(DataChecksumsWorkerDatabase);
 
 		db->dboid = pgdb->oid;
 		db->dbname = pstrdup(NameStr(pgdb->datname));
@@ -1469,11 +1684,11 @@ FreeDatabaseList(List *dblist)
  *		Compile a list of relations in the database
  *
  * Returns a list of OIDs for the requested relation types. If temp_relations
- * is True then only temporary relations are returned. If temp_relations is
- * False then non-temporary relations which have data checksums are returned.
- * If include_shared is True then shared relations are included as well in a
- * non-temporary list. include_shared has no relevance when building a list of
- * temporary relations.
+ * is True then only temporary relations with storage are returned.  If
+ * temp_relations is False then non-temporary relations with storage are
+ * returned.  If include_shared is True then shared relations are included as
+ * well in a non-temporary list. include_shared has no relevance when building
+ * a list of temporary relations.
  */
 static List *
 BuildRelationList(bool temp_relations, bool include_shared)
@@ -1494,6 +1709,9 @@ BuildRelationList(bool temp_relations, bool include_shared)
 	{
 		Form_pg_class pgc = (Form_pg_class) GETSTRUCT(tup);
 
+		if (!RELKIND_HAS_STORAGE(pgc->relkind))
+			continue;
+
 		/* Only include temporary relations when explicitly asked to */
 		if (pgc->relpersistence == RELPERSISTENCE_TEMP)
 		{
@@ -1507,9 +1725,6 @@ BuildRelationList(bool temp_relations, bool include_shared)
 			 * immediately as the current relation isn't a temp relation.
 			 */
 			if (temp_relations)
-				continue;
-
-			if (!RELKIND_HAS_STORAGE(pgc->relkind))
 				continue;
 
 			if (pgc->relisshared && !include_shared)
@@ -1581,6 +1796,7 @@ DataChecksumsWorkerMain(Datum arg)
 	/* worker will have a separate entry in pg_stat_progress_data_checksums */
 	pgstat_progress_start_command(PROGRESS_COMMAND_DATACHECKSUMS,
 								  InvalidOid);
+	ResetDataChecksumsProgressCounters();
 
 	/*
 	 * Get a list of all temp tables present as we start in this database. We

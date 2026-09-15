@@ -157,7 +157,6 @@ static const int dbObjectTypePriority[] =
 StaticAssertDecl(lengthof(dbObjectTypePriority) == NUM_DUMPABLE_OBJECT_TYPES,
 				 "array length mismatch");
 
-static DumpId preDataBoundId;
 static DumpId postDataBoundId;
 
 
@@ -569,7 +568,6 @@ sortDumpableObjects(DumpableObject **objs, int numObjs,
 	 * Saving the boundary IDs in static variables is a bit grotty, but seems
 	 * better than adding them to parameter lists of subsidiary functions.
 	 */
-	preDataBoundId = preBoundaryId;
 	postDataBoundId = postBoundaryId;
 
 	ordering = pg_malloc_array(DumpableObject *, numObjs);
@@ -578,7 +576,7 @@ sortDumpableObjects(DumpableObject **objs, int numObjs,
 
 	memcpy(objs, ordering, numObjs * sizeof(DumpableObject *));
 
-	free(ordering);
+	pg_free(ordering);
 }
 
 /*
@@ -734,8 +732,8 @@ TopoSort(DumpableObject **objs,
 
 	/* Done */
 	binaryheap_free(pendingHeap);
-	free(beforeConstraints);
-	free(idMap);
+	pg_free(beforeConstraints);
+	pg_free(idMap);
 
 	return (i == 0);
 }
@@ -830,9 +828,9 @@ findDependencyLoops(DumpableObject **objs, int nObjs, int totObjs)
 	if (!fixedloop)
 		pg_fatal("could not identify dependency loop");
 
-	free(workspace);
-	free(searchFailed);
-	free(processed);
+	pg_free(workspace);
+	pg_free(searchFailed);
+	pg_free(processed);
 }
 
 /*

@@ -243,8 +243,10 @@ main(int argc, char *argv[])
 		opt.manifest_checksums = CHECKSUM_TYPE_NONE;
 
 	if (opt.dry_run)
-		pg_log_info("Executing in dry-run mode.\n"
-					"The target directory will not be modified.");
+	{
+		pg_log_info("executing in dry-run mode");
+		pg_log_info_detail("The target directory will not be modified.");
+	}
 
 	/* Check that the platform supports the requested copy method. */
 	if (opt.copy_method == COPY_METHOD_CLONE)
@@ -668,13 +670,19 @@ check_control_files(int n_backups, char **backup_dirs)
 	pg_log_debug("system identifier is %" PRIu64, system_identifier);
 
 	/*
-	 * Warn the user if not all backups are in the same state with regards to
-	 * checksums.
+	 * Reject a chain whose backups were not all in the same state with
+	 * regards to checksums.  The loop above only flags that when the last
+	 * backup has checksums enabled: the blocks taken from the older backups
+	 * have no checksums, and pg_combinebackup does not recompute them, so the
+	 * combined cluster would fail verification as soon as it reads them.  The
+	 * other direction is harmless, since stale checksums are never verified
+	 * while checksums are disabled.
 	 */
 	if (data_checksum_mismatch)
 	{
-		pg_log_warning("only some backups have checksums enabled");
-		pg_log_warning_hint("Disable, and optionally reenable, checksums on the output directory to avoid failures.");
+		pg_log_error("only some backups have checksums enabled");
+		pg_log_error_hint("Take a new full backup after changing the data checksum state with pg_checksums.");
+		exit(1);
 	}
 
 	return system_identifier;
@@ -1159,7 +1167,7 @@ process_directory_recursively(Oid tsoid,
 
 		/* Avoid leaking memory. */
 		if (checksum_payload != NULL)
-			pfree(checksum_payload);
+			pg_free(checksum_payload);
 	}
 
 	closedir(dir);
@@ -1227,7 +1235,6 @@ scan_for_existing_tablespaces(char *pathname, cb_options *opt)
 		Oid			oid;
 		char		tblspcdir[MAXPGPATH];
 		char		link_target[MAXPGPATH];
-		int			link_length;
 		cb_tablespace *ts;
 		cb_tablespace *otherts;
 		PGFileType	type;
@@ -1268,6 +1275,7 @@ scan_for_existing_tablespaces(char *pathname, cb_options *opt)
 		 */
 		if (type == PGFILETYPE_LNK)
 		{
+			ssize_t		link_length;
 			cb_tablespace_mapping *tsmap;
 
 			/* Read the link target. */
@@ -1344,6 +1352,7 @@ slurp_file(int fd, char *filename, StringInfo buf, int maxlen)
 {
 	struct stat st;
 	ssize_t		rb;
+	size_t		len;
 
 	/* Check file size, and complain if it's too large. */
 	if (fstat(fd, &st) != 0)
@@ -1351,23 +1360,25 @@ slurp_file(int fd, char *filename, StringInfo buf, int maxlen)
 	if (st.st_size > maxlen)
 		pg_fatal("file \"%s\" is too large", filename);
 
+	len = st.st_size;
+
 	/* Make sure we have enough space. */
-	enlargeStringInfo(buf, st.st_size);
+	enlargeStringInfo(buf, len);
 
 	/* Read the data. */
-	rb = read(fd, &buf->data[buf->len], st.st_size);
+	rb = read(fd, &buf->data[buf->len], len);
 
 	/*
 	 * We don't expect any concurrent changes, so we should read exactly the
 	 * expected number of bytes.
 	 */
-	if (rb != st.st_size)
+	if (rb != len)
 	{
 		if (rb < 0)
 			pg_fatal("could not read file \"%s\": %m", filename);
 		else
-			pg_fatal("could not read file \"%s\": read %zd of %lld",
-					 filename, rb, (long long int) st.st_size);
+			pg_fatal("could not read file \"%s\": read %zd of %zu",
+					 filename, rb, len);
 	}
 
 	/* Adjust buffer length for new data and restore trailing-\0 invariant */

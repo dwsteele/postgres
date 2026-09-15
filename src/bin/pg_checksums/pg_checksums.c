@@ -196,8 +196,9 @@ scan_file(const char *fn, int segmentno)
 	for (blockno = 0;; blockno++)
 	{
 		uint16		csum;
-		int			r = read(f, buf.data, BLCKSZ);
+		ssize_t		r;
 
+		r = read(f, buf.data, BLCKSZ);
 		if (r == 0)
 			break;
 		if (r != BLCKSZ)
@@ -206,8 +207,8 @@ scan_file(const char *fn, int segmentno)
 				pg_fatal("could not read block %u in file \"%s\": %m",
 						 blockno, fn);
 			else
-				pg_fatal("could not read block %u in file \"%s\": read %d of %d",
-						 blockno, fn, r, BLCKSZ);
+				pg_fatal("could not read block %u in file \"%s\": read %zd of %zu",
+						 blockno, fn, r, (size_t) BLCKSZ);
 		}
 		blocks_scanned++;
 
@@ -236,7 +237,7 @@ scan_file(const char *fn, int segmentno)
 		}
 		else if (mode == PG_MODE_ENABLE)
 		{
-			int			w;
+			ssize_t		w;
 
 			/*
 			 * Do not rewrite if the checksum is already set to the expected
@@ -262,8 +263,8 @@ scan_file(const char *fn, int segmentno)
 					pg_fatal("could not write block %u in file \"%s\": %m",
 							 blockno, fn);
 				else
-					pg_fatal("could not write block %u in file \"%s\": wrote %d of %d",
-							 blockno, fn, w, BLCKSZ);
+					pg_fatal("could not write block %u in file \"%s\": wrote %zd of %zu",
+							 blockno, fn, w, (size_t) BLCKSZ);
 			}
 		}
 
@@ -585,6 +586,21 @@ main(int argc, char *argv[])
 		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
 		pg_fatal("cluster must be shut down");
 
+	/*
+	 * An inprogress state means an online transition was cut short.  A
+	 * standby stopped mid-transition carries either state; a cleanly shut
+	 * down primary can still carry inprogress-off, which a fast shutdown
+	 * during pg_disable_data_checksums() leaves behind, while inprogress-on
+	 * is always resolved by the launcher's exit cleanup.
+	 */
+	if (ControlFile->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_ON ||
+		ControlFile->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
+	{
+		pg_log_error("an online data checksum state transition was interrupted");
+		pg_log_error_hint("Start and cleanly shut down the cluster once to reset the data checksum state, then retry. On a standby, let replication complete the transition first.");
+		exit(1);
+	}
+
 	if (ControlFile->data_checksum_version != PG_DATA_CHECKSUM_VERSION &&
 		mode == PG_MODE_CHECK)
 		pg_fatal("data checksums are not enabled in cluster");
@@ -647,6 +663,16 @@ main(int argc, char *argv[])
 		ControlFile->data_checksum_version =
 			(mode == PG_MODE_ENABLE) ? PG_DATA_CHECKSUM_VERSION : PG_DATA_CHECKSUM_OFF;
 
+		/*
+		 * Mark the state as changed locally, without a WAL record.  Recovery
+		 * then does not let a replayed checkpoint overwrite it, as no record
+		 * could restore the change afterwards.  The watermark is left alone:
+		 * XLOG2_CHECKSUMS records at or below it stay covered, while records
+		 * above it, which this node has not applied yet, still take effect on
+		 * replay no matter when they were written.
+		 */
+		ControlFile->data_checksum_is_local = true;
+
 		if (do_sync)
 		{
 			pg_log_info("syncing data directory");
@@ -662,6 +688,12 @@ main(int argc, char *argv[])
 			printf(_("Checksums enabled in cluster\n"));
 		else
 			printf(_("Checksums disabled in cluster\n"));
+
+		printf(_("This change applies to this data directory only.\n"));
+		if (ControlFile->state == DB_SHUTDOWNED_IN_RECOVERY)
+			printf(_("This node appears to be a standby; apply the same change to the primary and all other standbys.\n"));
+		else
+			printf(_("In a replication setup, apply the same change to every node while all are stopped, before restarting any of them.\n"));
 	}
 
 	return 0;

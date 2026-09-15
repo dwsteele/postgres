@@ -485,7 +485,7 @@ ExecInitGenerated(ResultRelInfo *resultRelInfo,
 	 */
 	oldContext = MemoryContextSwitchTo(estate->es_query_cxt);
 
-	ri_GeneratedExprs = (ExprState **) palloc0(natts * sizeof(ExprState *));
+	ri_GeneratedExprs = palloc0_array(ExprState *, natts);
 	ri_NumGeneratedNeeded = 0;
 
 	for (int i = 0; i < natts; i++)
@@ -1335,8 +1335,18 @@ ExecInsert(ModifyTableContext *context,
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
 		ExecWithCheckOptions(WCO_VIEW_CHECK, resultRelInfo, slot, estate);
 
-	/* Process RETURNING if present */
-	if (resultRelInfo->ri_projectReturning)
+	/*
+	 * Process RETURNING if present.
+	 *
+	 * If this is an UPDATE/DELETE ... FOR PORTION OF, we do not return the
+	 * leftover rows inserted by ExecForPortionOfLeftovers().  Note that we
+	 * must check mtstate->operation here, because we *do* want to process the
+	 * newly inserted row of a cross-partition UPDATE with a FOR PORTION OF
+	 * clause (ExecCrossPartitionUpdate() leaves mtstate->operation set to
+	 * CMD_UPDATE, whereas ExecForPortionOfLeftovers() sets it to CMD_INSERT).
+	 */
+	if (resultRelInfo->ri_projectReturning &&
+		!(node->forPortionOf && mtstate->operation == CMD_INSERT))
 	{
 		TupleTableSlot *oldSlot = NULL;
 
@@ -2765,8 +2775,27 @@ ExecUpdate(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	 * Prepare for the update.  This includes BEFORE ROW triggers, so we're
 	 * done if it says we are.
 	 */
+	context->tmfd.traversed = false;
 	if (!ExecUpdatePrologue(context, resultRelInfo, tupleid, oldtuple, slot, NULL))
 		return NULL;
+
+	/*
+	 * If the target tuple was concurrently updated, the trigger code will
+	 * have done EPQ and updated tupleid, following the update chain.  In this
+	 * case, we must fetch the most recent version of old tuple for the
+	 * benefit of RETURNING.  Technically, we could get away with not doing
+	 * this, if there is no RETURNING clause, or it doesn't refer to OLD, but
+	 * it seems preferable to always ensure that the contents of oldSlot are
+	 * correct.
+	 */
+	if (context->tmfd.traversed)
+	{
+		if (!table_tuple_fetch_row_version(resultRelInfo->ri_RelationDesc,
+										   tupleid,
+										   SnapshotAny,
+										   oldSlot))
+			elog(ERROR, "failed to re-fetch tuple updated during trigger execution");
+	}
 
 	/* INSTEAD OF ROW UPDATE Triggers */
 	if (resultRelInfo->ri_TrigDesc &&
@@ -5590,9 +5619,6 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		TupleDesc	tupDesc;
 		ForPortionOfExpr *forPortionOf;
 		Datum		targetRange;
-		bool		isNull;
-		ExprContext *econtext;
-		ExprState  *exprState;
 		ForPortionOfState *fpoState;
 
 		rootRelInfo = mtstate->resultRelInfo;
@@ -5603,26 +5629,35 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		forPortionOf = (ForPortionOfExpr *) node->forPortionOf;
 
 		/* Eval the FOR PORTION OF target */
-		if (mtstate->ps.ps_ExprContext == NULL)
-			ExecAssignExprContext(estate, &mtstate->ps);
-		econtext = mtstate->ps.ps_ExprContext;
+		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+		{
+			bool		isNull;
+			ExprContext *econtext;
+			ExprState  *exprState;
 
-		exprState = ExecPrepareExpr((Expr *) forPortionOf->targetRange, estate);
-		targetRange = ExecEvalExpr(exprState, econtext, &isNull);
+			if (mtstate->ps.ps_ExprContext == NULL)
+				ExecAssignExprContext(estate, &mtstate->ps);
+			econtext = mtstate->ps.ps_ExprContext;
 
-		/*
-		 * FOR PORTION OF ... TO ... FROM should never give us a NULL target,
-		 * but FOR PORTION OF (...) could.
-		 */
-		if (isNull)
-			ereport(ERROR,
-					(errmsg("FOR PORTION OF target was null")),
-					executor_errposition(estate, forPortionOf->targetLocation));
+			exprState = ExecPrepareExpr((Expr *) forPortionOf->targetRange, estate);
+			targetRange = ExecEvalExpr(exprState, econtext, &isNull);
+
+			/*
+			 * FOR PORTION OF ... FROM ... TO should never give us a NULL
+			 * target, but FOR PORTION OF (...) could.
+			 */
+			if (isNull)
+				ereport(ERROR,
+						(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+						 errmsg("FOR PORTION OF target must not be null"),
+						 executor_errposition(estate, forPortionOf->targetLocation)));
+		}
+		else
+			targetRange = (Datum) 0;
 
 		/* Create state for FOR PORTION OF operation */
 
 		fpoState = makeNode(ForPortionOfState);
-		fpoState->fp_rangeName = forPortionOf->range_name;
 		fpoState->fp_rangeType = forPortionOf->rangeType;
 		fpoState->fp_rangeAttno = forPortionOf->rangeVar->varattno;
 		fpoState->fp_targetRange = targetRange;
@@ -5909,7 +5944,6 @@ ExecInitForPortionOf(ModifyTableState *mtstate, EState *estate,
 
 	leafState = makeNode(ForPortionOfState);
 
-	leafState->fp_rangeName = fpoState->fp_rangeName;
 	leafState->fp_rangeType = fpoState->fp_rangeType;
 	leafState->fp_targetRange = fpoState->fp_targetRange;
 	map = ExecGetChildToRootMap(resultRelInfo);

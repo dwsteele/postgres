@@ -610,11 +610,11 @@ ExecCheckPermissions(List *rangeTable, List *rteperminfos,
 
 			/*
 			 * Only relation RTEs and subquery RTEs that were once relation
-			 * RTEs (views, property graphs) have their perminfoindex set.
+			 * RTEs (views) have their perminfoindex set.
 			 */
 			Assert(rte->rtekind == RTE_RELATION ||
 				   (rte->rtekind == RTE_SUBQUERY &&
-					(rte->relkind == RELKIND_VIEW || rte->relkind == RELKIND_PROPGRAPH)));
+					rte->relkind == RELKIND_VIEW));
 
 			(void) getRTEPermissionInfo(rteperminfos, rte);
 			/* Many-to-one mapping not allowed */
@@ -1183,12 +1183,6 @@ CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation,
 					break;
 			}
 			break;
-		case RELKIND_PROPGRAPH:
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("cannot change property graph \"%s\"",
-							RelationGetRelationName(resultRel))));
-			break;
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -1196,6 +1190,24 @@ CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation,
 							RelationGetRelationName(resultRel))));
 			break;
 	}
+
+	/*
+	 * Conflict log tables are managed by the system to record logical
+	 * replication conflicts.  We allow DELETE and TRUNCATE to permit users to
+	 * manually prune these logs, but manual data insertion or modification
+	 * (INSERT, UPDATE, MERGE) is prohibited to maintain the integrity of the
+	 * system-generated logs.
+	 *
+	 * Since TRUNCATE is handled as a separate utility command, we only need
+	 * to explicitly permit CMD_DELETE here.
+	 */
+	if (IsConflictLogTableNamespace(RelationGetNamespace(resultRel)) &&
+		operation != CMD_DELETE)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot modify or insert data into conflict log table \"%s\"",
+						RelationGetRelationName(resultRel)),
+				 errdetail("Conflict log tables are system-managed and only support cleanup using DELETE or TRUNCATE.")));
 }
 
 /*
@@ -1253,13 +1265,6 @@ CheckValidRowMarkRel(Relation rel, RowMarkType markType)
 						 errmsg("cannot lock rows in foreign table \"%s\"",
 								RelationGetRelationName(rel))));
 			break;
-		case RELKIND_PROPGRAPH:
-			/* Should not get here; rewriter should have expanded the graph */
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg_internal("cannot lock rows in property graph \"%s\"",
-									 RelationGetRelationName(rel))));
-			break;
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -1267,6 +1272,16 @@ CheckValidRowMarkRel(Relation rel, RowMarkType markType)
 							RelationGetRelationName(rel))));
 			break;
 	}
+
+	/*
+	 * Conflict log tables are managed by the system to record logical
+	 * replication conflicts.
+	 */
+	if (IsConflictLogTableNamespace(RelationGetNamespace(rel)))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot lock rows in the conflict log table \"%s\"",
+						RelationGetRelationName(rel))));
 }
 
 /*
@@ -1641,6 +1656,22 @@ ExecCloseResultRelations(EState *estate)
 			table_close(rInfo->ri_RelationDesc, NoLock);
 		}
 	}
+
+	/*
+	 * Now close any relations that we opened for trigger target
+	 * ResultRelInfos.
+	 */
+	ExecCloseTrigTargetRelations(estate);
+}
+
+/*
+ * Close any relations that have been opened for ResultRelInfos opened
+ * specifically for trigger target relations.
+ */
+void
+ExecCloseTrigTargetRelations(EState *estate)
+{
+	ListCell   *l;
 
 	/* Close any relations that have been opened by ExecGetTriggerResultRel(). */
 	foreach(l, estate->es_trig_target_relations)

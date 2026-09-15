@@ -146,10 +146,21 @@ RESET client_min_messages;
           Owner           | All tables | All sequences | Inserts | Updates | Deletes | Truncates | Generated columns | Via root | Description 
 --------------------------+------------+---------------+---------+---------+---------+-----------+-------------------+----------+-------------
  regress_publication_user | f          | f             | t       | t       | t       | t         | none              | f        | 
-Tables:
-    "pub_test.testpub_nopk"
 Tables from schemas:
     "pub_test"
+
+-- table also covered by a published schema should appear only once in \d output
+\d pub_test.testpub_nopk
+           Table "pub_test.testpub_nopk"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ foo    | integer |           |          | 
+ bar    | integer |           |          | 
+Included in publications:
+    "testpub_for_tbl_schema"
+    "testpub_foralltables"
+    "testpub_forschema"
+    "testpub_fortable"
 
 -- weird parser corner case
 CREATE PUBLICATION testpub_parsertst FOR TABLE pub_test.testpub_nopk, CURRENT_SCHEMA;
@@ -167,8 +178,6 @@ ALTER PUBLICATION testpub_forschema ADD TABLE pub_test.testpub_nopk;
           Owner           | All tables | All sequences | Inserts | Updates | Deletes | Truncates | Generated columns | Via root | Description 
 --------------------------+------------+---------------+---------+---------+---------+-----------+-------------------+----------+-------------
  regress_publication_user | f          | f             | t       | t       | t       | t         | none              | f        | 
-Tables:
-    "pub_test.testpub_nopk"
 Tables from schemas:
     "pub_test"
 
@@ -270,6 +279,16 @@ CREATE PUBLICATION testpub_foralltables_excepttable2 FOR ALL TABLES EXCEPT (test
 ERROR:  syntax error at or near "testpub_tbl1"
 LINE 1: ..._foralltables_excepttable2 FOR ALL TABLES EXCEPT (testpub_tb...
                                                              ^
+-- A table in an EXCEPT clause cannot be changed to UNLOGGED.
+CREATE TABLE testpub_exc_unlogged_tbl (a int);
+CREATE PUBLICATION testpub_exc_unlogged FOR ALL TABLES EXCEPT (TABLE testpub_exc_unlogged_tbl);
+-- fail - the table is referenced in a publication EXCEPT clause
+ALTER TABLE testpub_exc_unlogged_tbl SET UNLOGGED;
+ERROR:  cannot change table "testpub_exc_unlogged_tbl" to unlogged because it is referenced by a publication
+DETAIL:  Unlogged relations cannot be published or excluded via an EXCEPT clause.
+HINT:  Drop the table from the publication, or remove it from the publication's EXCEPT clause, first.
+DROP PUBLICATION testpub_exc_unlogged;
+DROP TABLE testpub_exc_unlogged_tbl;
 ---------------------------------------------
 -- SET ALL TABLES/SEQUENCES
 ---------------------------------------------
@@ -832,10 +851,18 @@ RESET client_min_messages;
           Owner           | All tables | All sequences | Inserts | Updates | Deletes | Truncates | Generated columns | Via root | Description 
 --------------------------+------------+---------------+---------+---------+---------+-----------+-------------------+----------+-------------
  regress_publication_user | f          | f             | t       | t       | t       | t         | none              | f        | 
-Tables:
-    "testpub_rf_schema2.testpub_rf_tbl6" WHERE (i < 99)
 Tables from schemas:
     "testpub_rf_schema2"
+
+-- table with a row-filter, also covered by a published schema, should appear
+-- only once in \d output and without the row filter
+\d testpub_rf_schema2.testpub_rf_tbl6
+    Table "testpub_rf_schema2.testpub_rf_tbl6"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ i      | integer |           |          | 
+Included in publications:
+    "testpub6"
 
 -- fail - virtual generated column uses user-defined function
 -- (Actually, this already fails at CREATE TABLE rather than at CREATE
@@ -1522,7 +1549,7 @@ CREATE PUBLICATION testpub_fortbl FOR TABLE testpub_tbl1, pub_test.testpub_nopk;
 RESET client_min_messages;
 -- fail - already added
 ALTER PUBLICATION testpub_fortbl ADD TABLE testpub_tbl1;
-ERROR:  relation "testpub_tbl1" is already member of publication "testpub_fortbl"
+ERROR:  relation "testpub_tbl1" is already a member of publication "testpub_fortbl"
 -- fail - already added
 CREATE PUBLICATION testpub_fortbl FOR TABLE testpub_tbl1;
 ERROR:  publication "testpub_fortbl" already exists
@@ -1859,7 +1886,7 @@ Tables from schemas:
 
 -- add a schema which is already added to the publication
 ALTER PUBLICATION testpub1_forschema ADD TABLES IN SCHEMA pub_test1;
-ERROR:  schema "pub_test1" is already member of publication "testpub1_forschema"
+ERROR:  schema "pub_test1" is already a member of publication "testpub1_forschema"
 \dRp+ testpub1_forschema
                                                         Publication testpub1_forschema
           Owner           | All tables | All sequences | Inserts | Updates | Deletes | Truncates | Generated columns | Via root | Description 

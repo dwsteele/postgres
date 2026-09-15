@@ -161,7 +161,7 @@ static void psql_end_command(StringInfo buf, const char *database);
  * Convenience macros for printing TAP output with a more shorthand syntax
  * aimed at making the code more readable.
  */
-#define plan(x)				emit_tap_output(PLAN, "1..%i", (x))
+#define plan(x)				emit_tap_output(PLAN, "1..%d", (x))
 #define note(...)			emit_tap_output(NOTE, __VA_ARGS__)
 #define note_detail(...)	emit_tap_output(NOTE_DETAIL, __VA_ARGS__)
 #define diag(...)			emit_tap_output(DIAG, __VA_ARGS__)
@@ -811,7 +811,7 @@ initialize_environment(void)
 		new_pgoptions = psprintf("%s %s",
 								 old_pgoptions, my_pgoptions);
 		setenv("PGOPTIONS", new_pgoptions, 1);
-		free(new_pgoptions);
+		pfree(new_pgoptions);
 	}
 
 	if (temp_instance)
@@ -997,7 +997,7 @@ current_windows_user(const char **acct, const char **dom)
 			 GetLastError());
 	}
 
-	free(tokenuser);
+	pg_free(tokenuser);
 
 	*acct = accountname;
 	*dom = domainname;
@@ -1682,7 +1682,7 @@ wait_for_tests(PID_TYPE * pids, int *statuses, instr_time *stoptimes,
 	}
 
 #ifdef WIN32
-	free(active_pids);
+	pg_free(active_pids);
 #endif
 }
 

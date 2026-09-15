@@ -167,7 +167,8 @@ readOneRecord(const char *datadir, XLogRecPtr ptr, int tliIndex,
 void
 findLastCheckpoint(const char *datadir, XLogRecPtr forkptr, int tliIndex,
 				   XLogRecPtr *lastchkptrec, TimeLineID *lastchkpttli,
-				   XLogRecPtr *lastchkptredo, const char *restoreCommand)
+				   XLogRecPtr *lastchkptredo, uint32 *lastchkptdatachecksums,
+				   const char *restoreCommand)
 {
 	/* Walk backwards, starting from the given record */
 	XLogRecord *record;
@@ -255,6 +256,7 @@ findLastCheckpoint(const char *datadir, XLogRecPtr forkptr, int tliIndex,
 			*lastchkptrec = searchptr;
 			*lastchkpttli = checkPoint.ThisTimeLineID;
 			*lastchkptredo = checkPoint.redo;
+			*lastchkptdatachecksums = checkPoint.dataChecksumState;
 			break;
 		}
 
@@ -279,7 +281,7 @@ SimpleXLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
 	uint32		targetPageOff;
 	XLogRecPtr	targetSegEnd;
 	XLogSegNo	targetSegNo;
-	int			r;
+	ssize_t		r;
 
 	XLByteToSeg(targetPagePtr, targetSegNo, WalSegSz);
 	XLogSegNoOffsetToRecPtr(targetSegNo + 1, 0, WalSegSz, targetSegEnd);
@@ -370,9 +372,8 @@ SimpleXLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
 		if (r < 0)
 			pg_log_error("could not read file \"%s\": %m", xlogfpath);
 		else
-			pg_log_error("could not read file \"%s\": read %d of %zu",
+			pg_log_error("could not read file \"%s\": read %zd of %zu",
 						 xlogfpath, r, (Size) XLOG_BLCKSZ);
-
 		return -1;
 	}
 

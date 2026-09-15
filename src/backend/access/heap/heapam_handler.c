@@ -12,7 +12,7 @@
  *
  *
  * NOTES
- *	  This files wires up the lower level heapam.c et al routines with the
+ *	  This file wires up the lower level heapam.c et al routines with the
  *	  tableam abstraction.
  *
  *-------------------------------------------------------------------------
@@ -192,17 +192,11 @@ static void
 heapam_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 								  uint32 specToken, bool succeeded)
 {
-	bool		shouldFree = true;
-	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
-
 	/* adjust the tuple's state accordingly */
 	if (succeeded)
 		heap_finish_speculative(relation, &slot->tts_tid);
 	else
 		heap_abort_speculative(relation, &slot->tts_tid);
-
-	if (shouldFree)
-		pfree(tuple);
 }
 
 static TM_Result
@@ -666,16 +660,8 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	 */
 	if (OldIndex != NULL && !use_sort)
 	{
-		const int	ci_index[] = {
-			PROGRESS_REPACK_PHASE,
-			PROGRESS_REPACK_INDEX_RELID
-		};
-		int64		ci_val[2];
-
-		/* Set phase and OIDOldIndex to columns */
-		ci_val[0] = PROGRESS_REPACK_PHASE_INDEX_SCAN_HEAP;
-		ci_val[1] = RelationGetRelid(OldIndex);
-		pgstat_progress_update_multi_param(2, ci_index, ci_val);
+		pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
+									 PROGRESS_REPACK_PHASE_INDEX_SCAN_HEAP);
 
 		tableScan = NULL;
 		heapScan = NULL;
@@ -1971,7 +1957,7 @@ heapam_scan_get_blocks_done(HeapScanDesc hscan)
 	if (hscan->rs_base.rs_parallel != NULL)
 	{
 		bpscan = (ParallelBlockTableScanDesc) hscan->rs_base.rs_parallel;
-		startblock = bpscan->phs_startblock;
+		startblock = pg_atomic_read_u32(&bpscan->phs_startblock);
 	}
 	else
 		startblock = hscan->rs_startblock;

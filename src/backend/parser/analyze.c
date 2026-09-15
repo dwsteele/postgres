@@ -90,6 +90,9 @@ static Query *transformValuesClause(ParseState *pstate, SelectStmt *stmt);
 static Query *transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt);
 static Node *transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 									   bool isTopLevel, List **targetlist);
+static void constructSetOpTargetlist(ParseState *pstate, SetOperationStmt *op,
+									 const List *ltargetlist, const List *rtargetlist,
+									 List **targetlist, const char *context, bool recursive);
 static void determineRecursiveColTypes(ParseState *pstate,
 									   Node *larg, List *nrtargetlist);
 static Query *transformReturnStmt(ParseState *pstate, ReturnStmt *stmt);
@@ -1462,8 +1465,7 @@ transformForPortionOfClause(ParseState *pstate,
 										 EXPR_KIND_FOR_PORTION);
 		actual_arg_types[0] = exprType(result->targetFrom);
 		actual_arg_types[1] = exprType(result->targetTo);
-		args = list_make2(copyObject(result->targetFrom),
-						  copyObject(result->targetTo));
+		args = list_make2(result->targetFrom, result->targetTo);
 
 		/*
 		 * Check the bound types separately, for better error message and
@@ -1487,6 +1489,15 @@ transformForPortionOfClause(ParseState *pstate,
 					 parser_errposition(pstate, exprLocation(forPortionOf->target_end))));
 
 		make_fn_arguments(pstate, args, actual_arg_types, declared_arg_types);
+
+		/*
+		 * Keep the *coerced* bounds.  This lets prepared statements use
+		 * parameters without explicit casts, and it improves deparsing when
+		 * FOR PORTION OF appears in a function or RULE.
+		 */
+		result->targetFrom = copyObject((Node *) linitial(args));
+		result->targetTo = copyObject((Node *) lsecond(args));
+
 		result->targetRange = (Node *) makeFuncExpr(get_range_constructor2(attbasetype),
 													attbasetype,
 													args,
@@ -1606,7 +1617,6 @@ transformForPortionOfClause(ParseState *pstate,
 	else
 		result->rangeTargetList = NIL;
 
-	result->range_name = forPortionOf->range_name;
 	result->location = forPortionOf->location;
 	result->targetLocation = forPortionOf->target_location;
 
@@ -1811,14 +1821,12 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt,
 
 	qry->groupClause = transformGroupClause(pstate,
 											stmt->groupClause,
-											stmt->groupByAll,
 											&qry->groupingSets,
 											&qry->targetList,
 											qry->sortClause,
 											EXPR_KIND_GROUP_BY,
 											false /* allow SQL92 rules */ );
 	qry->groupDistinct = stmt->groupDistinct;
-	qry->groupByAll = stmt->groupByAll;
 
 	if (stmt->distinctClause == NIL)
 	{
@@ -1958,7 +1966,7 @@ transformValuesClause(ParseState *pstate, SelectStmt *stmt)
 			/* Remember post-transformation length of first sublist */
 			sublist_length = list_length(sublist);
 			/* and allocate array for per-column lists */
-			colexprs = (List **) palloc0(sublist_length * sizeof(List *));
+			colexprs = palloc0_array(List *, sublist_length);
 		}
 		else if (sublist_length != list_length(sublist))
 		{
@@ -2230,8 +2238,7 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 	qry->targetList = NIL;
 	targetvars = NIL;
 	targetnames = NIL;
-	sortnscolumns = (ParseNamespaceColumn *)
-		palloc0(list_length(sostmt->colTypes) * sizeof(ParseNamespaceColumn));
+	sortnscolumns = palloc0_array(ParseNamespaceColumn, list_length(sostmt->colTypes));
 	sortcolindex = 0;
 
 	forfour(lct, sostmt->colTypes,
@@ -2601,7 +2608,7 @@ transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
  * given SetOperationStmt node.  context is a string for error messages
  * ("UNION" etc.).  recursive is true if it is a recursive union.
  */
-void
+static void
 constructSetOpTargetlist(ParseState *pstate, SetOperationStmt *op,
 						 const List *ltargetlist, const List *rtargetlist,
 						 List **targetlist, const char *context, bool recursive)
@@ -3867,7 +3874,7 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 										   allrels, true);
 					break;
 				default:
-					/* ignore JOIN, SPECIAL, FUNCTION, VALUES, CTE RTEs */
+					/* ignore all other RTE kinds */
 					break;
 			}
 		}

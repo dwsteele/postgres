@@ -471,10 +471,6 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
 	snap = SnapBuildBuildSnapshot(builder);
 
 	/*
-	 * We know that snap->xmin is alive, enforced by the logical xmin
-	 * mechanism. Due to that we can do this without locks, we're only
-	 * changing our own value.
-	 *
 	 * Building an initial snapshot is expensive and an unenforced xmin
 	 * horizon would have bad consequences, therefore always double-check that
 	 * the horizon is enforced.
@@ -487,6 +483,11 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
 		elog(ERROR, "cannot build an initial slot snapshot as oldest safe xid %u follows snapshot's xmin %u",
 			 safeXid, snap->xmin);
 
+	/*
+	 * We know that snap->xmin is alive, enforced by the logical xmin
+	 * mechanism. Due to that we can do this without locks, we're only
+	 * changing our own value.
+	 */
 	MyProc->xmin = snap->xmin;
 
 	/* allocate in transaction context */
@@ -866,7 +867,6 @@ SnapBuildAddCommittedTxn(SnapBuild *builder, TransactionId xid)
 static void
 SnapBuildPurgeOlderTxn(SnapBuild *builder)
 {
-	int			off;
 	TransactionId *workspace;
 	int			surviving_xids = 0;
 
@@ -880,7 +880,7 @@ SnapBuildPurgeOlderTxn(SnapBuild *builder)
 						   builder->committed.xcnt * sizeof(TransactionId));
 
 	/* copy xids that still are interesting to workspace */
-	for (off = 0; off < builder->committed.xcnt; off++)
+	for (size_t off = 0; off < builder->committed.xcnt; off++)
 	{
 		if (NormalTransactionIdPrecedes(builder->committed.xip[off],
 										builder->xmin))
@@ -906,6 +906,8 @@ SnapBuildPurgeOlderTxn(SnapBuild *builder)
 	 */
 	if (builder->catchange.xcnt > 0)
 	{
+		size_t		off;
+
 		/*
 		 * Since catchange.xip is sorted, we find the lower bound of xids that
 		 * are still interesting.
@@ -1936,7 +1938,7 @@ snapshot_not_interesting:
 static void
 SnapBuildRestoreContents(int fd, void *dest, Size size, const char *path)
 {
-	int			readBytes;
+	ssize_t		readBytes;
 
 	pgstat_report_wait_start(WAIT_EVENT_SNAPBUILD_READ);
 	readBytes = read(fd, dest, size);
@@ -1957,7 +1959,7 @@ SnapBuildRestoreContents(int fd, void *dest, Size size, const char *path)
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("could not read file \"%s\": read %d of %zu",
+					 errmsg("could not read file \"%s\": read %zd of %zu",
 							path, readBytes, size)));
 	}
 }

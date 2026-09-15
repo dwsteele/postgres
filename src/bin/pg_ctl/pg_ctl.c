@@ -75,7 +75,9 @@ StaticAssertDecl(USECS_PER_SEC % WAITS_PER_SEC == 0,
 
 static bool do_wait = true;
 static int	wait_seconds = DEFAULT_WAIT;
+#ifdef WIN32
 static bool wait_seconds_arg = false;
+#endif
 static bool silent_mode = false;
 static ShutdownMode shutdown_mode = FAST_MODE;
 static int	sig = SIGINT;		/* default */
@@ -87,10 +89,12 @@ static char *post_opts = NULL;
 static const char *progname;
 static char *log_file = NULL;
 static char *exec_path = NULL;
+#ifdef WIN32
 static char *event_source = NULL;
 static char *register_servicename = "PostgreSQL";	/* FIXME: + version ID? */
 static char *register_username = NULL;
 static char *register_password = NULL;
+#endif
 static char *argv0 = NULL;
 static bool allow_core_files = false;
 static time_t start_time;
@@ -317,11 +321,11 @@ readfile(const char *path, int *numlines)
 	int			fd;
 	int			nlines;
 	char	  **result;
+	size_t		buflen;
 	char	   *buffer;
 	char	   *linebegin;
-	int			i;
 	int			n;
-	int			len;
+	ssize_t		nread;
 	struct stat statbuf;
 
 	*numlines = 0;				/* in case of failure or empty file */
@@ -350,14 +354,16 @@ readfile(const char *path, int *numlines)
 		*result = NULL;
 		return result;
 	}
-	buffer = pg_malloc(statbuf.st_size + 1);
 
-	len = read(fd, buffer, statbuf.st_size + 1);
+	buflen = statbuf.st_size + 1;
+	buffer = pg_malloc(buflen);
+
+	nread = read(fd, buffer, buflen);
 	close(fd);
-	if (len != statbuf.st_size)
+	if (nread != buflen - 1)
 	{
 		/* oops, the file size changed between fstat and read */
-		free(buffer);
+		pg_free(buffer);
 		return NULL;
 	}
 
@@ -367,7 +373,7 @@ readfile(const char *path, int *numlines)
 	 * any characters after the last newline will be ignored.
 	 */
 	nlines = 0;
-	for (i = 0; i < len; i++)
+	for (ssize_t i = 0; i < nread; i++)
 	{
 		if (buffer[i] == '\n')
 			nlines++;
@@ -380,7 +386,7 @@ readfile(const char *path, int *numlines)
 	/* now split the buffer into lines */
 	linebegin = buffer;
 	n = 0;
-	for (i = 0; i < len; i++)
+	for (ssize_t i = 0; i < nread; i++)
 	{
 		if (buffer[i] == '\n')
 		{
@@ -398,7 +404,7 @@ readfile(const char *path, int *numlines)
 	}
 	result[n] = NULL;
 
-	free(buffer);
+	pg_free(buffer);
 
 	return result;
 }
@@ -1907,8 +1913,6 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 static PTOKEN_PRIVILEGES
 GetPrivilegesToDelete(HANDLE hToken)
 {
-	int			i,
-				j;
 	DWORD		length;
 	PTOKEN_PRIVILEGES tokenPrivs;
 	LUID		luidLockPages;
@@ -1946,12 +1950,12 @@ GetPrivilegesToDelete(HANDLE hToken)
 		return NULL;
 	}
 
-	for (i = 0; i < tokenPrivs->PrivilegeCount; i++)
+	for (DWORD i = 0; i < tokenPrivs->PrivilegeCount; i++)
 	{
 		if (memcmp(&tokenPrivs->Privileges[i].Luid, &luidLockPages, sizeof(LUID)) == 0 ||
 			memcmp(&tokenPrivs->Privileges[i].Luid, &luidChangeNotify, sizeof(LUID)) == 0)
 		{
-			for (j = i; j < tokenPrivs->PrivilegeCount - 1; j++)
+			for (DWORD j = i; j < tokenPrivs->PrivilegeCount - 1; j++)
 				tokenPrivs->Privileges[j] = tokenPrivs->Privileges[j + 1];
 			tokenPrivs->PrivilegeCount--;
 		}
@@ -2168,12 +2172,12 @@ adjust_data_dir(void)
 		write_stderr(_("%s: could not determine the data directory using command \"%s\"\n"), progname, cmd);
 		exit(1);
 	}
-	free(my_exec_path);
+	pg_free(my_exec_path);
 
 	/* strip trailing newline and carriage return */
 	(void) pg_strip_crlf(filename);
 
-	free(pg_data);
+	pg_free(pg_data);
 	pg_data = pg_strdup(filename);
 	canonicalize_path(pg_data);
 }
@@ -2288,11 +2292,17 @@ main(int argc, char **argv)
 					 * but we do -D too for clearer postmaster 'ps' display
 					 */
 					pgdata_opt = psprintf("-D \"%s\" ", pgdata_D);
-					free(pgdata_D);
+					pg_free(pgdata_D);
 					break;
 				}
 			case 'e':
+#ifdef WIN32
 				event_source = pg_strdup(optarg);
+#else
+				write_stderr(_("%s: -%c option not supported on this platform\n"),
+							 progname, c);
+				exit(1);
+#endif
 				break;
 			case 'l':
 				log_file = pg_strdup(optarg);
@@ -2301,7 +2311,13 @@ main(int argc, char **argv)
 				set_mode(optarg);
 				break;
 			case 'N':
+#ifdef WIN32
 				register_servicename = pg_strdup(optarg);
+#else
+				write_stderr(_("%s: -%c option not supported on this platform\n"),
+							 progname, c);
+				exit(1);
+#endif
 				break;
 			case 'o':
 				/* append option? */
@@ -2319,7 +2335,13 @@ main(int argc, char **argv)
 				exec_path = pg_strdup(optarg);
 				break;
 			case 'P':
+#ifdef WIN32
 				register_password = pg_strdup(optarg);
+#else
+				write_stderr(_("%s: -%c option not supported on this platform\n"),
+							 progname, c);
+				exit(1);
+#endif
 				break;
 			case 's':
 				silent_mode = true;
@@ -2328,21 +2350,29 @@ main(int argc, char **argv)
 #ifdef WIN32
 				set_starttype(optarg);
 #else
-				write_stderr(_("%s: -S option not supported on this platform\n"),
-							 progname);
+				write_stderr(_("%s: -%c option not supported on this platform\n"),
+							 progname, c);
 				exit(1);
 #endif
 				break;
 			case 't':
 				wait_seconds = atoi(optarg);
+#ifdef WIN32
 				wait_seconds_arg = true;
+#endif
 				break;
 			case 'U':
+#ifdef WIN32
 				if (strchr(optarg, '\\'))
 					register_username = pg_strdup(optarg);
 				else
 					/* Prepend .\ for local accounts */
 					register_username = psprintf(".\\%s", optarg);
+#else
+				write_stderr(_("%s: -%c option not supported on this platform\n"),
+							 progname, c);
+				exit(1);
+#endif
 				break;
 			case 'w':
 				do_wait = true;

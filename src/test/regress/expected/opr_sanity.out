@@ -890,6 +890,8 @@ btoid8cmp(oid8,oid8)
 bytea(uuid)
 tid_block(tid)
 tid_offset(tid)
+uuid_larger(uuid,uuid)
+uuid_smaller(uuid,uuid)
 -- Check that functions without argument are not marked as leakproof.
 SELECT p1.oid::regprocedure
 FROM pg_proc p1 JOIN pg_namespace pn
@@ -1033,16 +1035,16 @@ WHERE c.castmethod = 'b' AND
                     k.casttarget = c.castsource);
     castsource     |    casttarget     | castfunc | castcontext 
 -------------------+-------------------+----------+-------------
- text              | character         |        0 | i
+ xml               | character varying |        0 | a
+ xml               | text              |        0 | a
  character varying | character         |        0 | i
- pg_node_tree      | text              |        0 | i
- pg_ndistinct      | bytea             |        0 | i
- pg_dependencies   | bytea             |        0 | i
+ text              | character         |        0 | i
+ xml               | character         |        0 | a
  pg_mcv_list       | bytea             |        0 | i
  cidr              | inet              |        0 | i
- xml               | text              |        0 | a
- xml               | character varying |        0 | a
- xml               | character         |        0 | a
+ pg_dependencies   | bytea             |        0 | i
+ pg_node_tree      | text              |        0 | i
+ pg_ndistinct      | bytea             |        0 | i
 (10 rows)
 
 -- **************** pg_conversion ****************

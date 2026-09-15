@@ -18,16 +18,14 @@
 #include <unicode/ustring.h>
 
 /*
- * ucol_strcollUTF8() was introduced in ICU 50, but it is buggy before ICU 53.
- * (see
- * <https://www.postgresql.org/message-id/flat/f1438ec6-22aa-4029-9a3b-26f79d330e72%40manitou-mail.org>)
+ * We require ICU 55 to be able to use the "und" spelling of the root locale.
+ * (Prior versions do not recognize this locale, and moreover fall back to the
+ * environment for unrecognized locale names, which could cause confusion and
+ * corruption.)
  */
-#if U_ICU_VERSION_MAJOR_NUM >= 53
-#define HAVE_UCOL_STRCOLLUTF8 1
-#else
-#undef HAVE_UCOL_STRCOLLUTF8
+#if U_ICU_VERSION_MAJOR_NUM < 55
+#error ICU version 55 or later is required
 #endif
-
 #endif
 
 #include "access/htup_details.h"
@@ -72,8 +70,6 @@ static size_t strupper_icu_utf8(char *dest, size_t destsize, const char *src,
 								size_t srclen, pg_locale_t locale);
 static size_t strfold_icu_utf8(char *dest, size_t destsize, const char *src,
 							   size_t srclen, pg_locale_t locale);
-static size_t downcase_ident_icu(char *dst, size_t dstsize, const char *src,
-								 size_t srclen, pg_locale_t locale);
 static int	strncoll_icu(const char *arg1, size_t len1,
 						 const char *arg2, size_t len2,
 						 pg_locale_t locale);
@@ -105,14 +101,12 @@ static size_t strnxfrm_prefix_icu(char *dest, size_t destsize,
 								  pg_locale_t locale);
 static size_t strxfrm_prefix_icu(char *dest, size_t destsize, const char *src,
 								 pg_locale_t locale);
-#ifdef HAVE_UCOL_STRCOLLUTF8
 static int	strncoll_icu_utf8(const char *arg1, size_t len1,
 							  const char *arg2, size_t len2,
 							  pg_locale_t locale);
 static int	strcoll_icu_utf8(const char *arg1,
 							 const char *arg2,
 							 pg_locale_t locale);
-#endif
 static size_t strnxfrm_prefix_icu_utf8(char *dest, size_t destsize,
 									   const char *src, size_t srclen,
 									   pg_locale_t locale);
@@ -145,7 +139,7 @@ static int32_t foldcase_options(const char *locale);
 
 /*
  * XXX: many of the functions below rely on casts directly from pg_wchar to
- * UChar32, which is correct for UTF-8 and LATIN1, but not in general.
+ * UChar32, which is correct for the UTF-8 encoding, but not in general.
  */
 
 static pg_wchar
@@ -171,13 +165,8 @@ static const struct collate_methods collate_methods_icu = {
 };
 
 static const struct collate_methods collate_methods_icu_utf8 = {
-#ifdef HAVE_UCOL_STRCOLLUTF8
 	.strncoll = strncoll_icu_utf8,
 	.strcoll = strcoll_icu_utf8,
-#else
-	.strncoll = strncoll_icu,
-	.strcoll = strcoll_icu,
-#endif
 	.strnxfrm = strnxfrm_icu,
 	.strxfrm = strxfrm_icu,
 	.strnxfrm_prefix = strnxfrm_prefix_icu_utf8,
@@ -248,6 +237,20 @@ wc_isxdigit_icu(pg_wchar wc, pg_locale_t locale)
 static bool
 wc_iscased_icu(pg_wchar wc, pg_locale_t locale)
 {
+	/*
+	 * For non-UTF8 encodings (single or multibyte), pg_wchar may not be a
+	 * codepoint, so we conservatively assume that any non-ASCII character
+	 * could be case-varying.
+	 */
+	if (wc > (pg_wchar) 127)
+		return true;
+
+	return u_hasBinaryProperty(wc, UCHAR_CASED);
+}
+
+static bool
+wc_iscased_icu_utf8(pg_wchar wc, pg_locale_t locale)
+{
 	return u_hasBinaryProperty(wc, UCHAR_CASED);
 }
 
@@ -256,7 +259,6 @@ static const struct ctype_methods ctype_methods_icu = {
 	.strtitle = strtitle_icu,
 	.strupper = strupper_icu,
 	.strfold = strfold_icu,
-	.downcase_ident = downcase_ident_icu,
 	.wc_isdigit = wc_isdigit_icu,
 	.wc_isalpha = wc_isalpha_icu,
 	.wc_isalnum = wc_isalnum_icu,
@@ -277,8 +279,6 @@ static const struct ctype_methods ctype_methods_icu_utf8 = {
 	.strtitle = strtitle_icu_utf8,
 	.strupper = strupper_icu_utf8,
 	.strfold = strfold_icu_utf8,
-	/* uses plain ASCII semantics for historical reasons */
-	.downcase_ident = NULL,
 	.wc_isdigit = wc_isdigit_icu,
 	.wc_isalpha = wc_isalpha_icu,
 	.wc_isalnum = wc_isalnum_icu,
@@ -289,34 +289,12 @@ static const struct ctype_methods ctype_methods_icu_utf8 = {
 	.wc_ispunct = wc_ispunct_icu,
 	.wc_isspace = wc_isspace_icu,
 	.wc_isxdigit = wc_isxdigit_icu,
-	.wc_iscased = wc_iscased_icu,
+	.wc_iscased = wc_iscased_icu_utf8,
 	.wc_toupper = toupper_icu,
 	.wc_tolower = tolower_icu,
 };
 
-/*
- * ICU still depends on libc for compatibility with certain historical
- * behavior for single-byte encodings.  See downcase_ident_icu().
- *
- * XXX: consider fixing by decoding the single byte into a code point, and
- * using u_tolower().
- */
-static locale_t
-make_libc_ctype_locale(const char *ctype)
-{
-	locale_t	loc;
-
-#ifndef WIN32
-	loc = newlocale(LC_CTYPE_MASK, ctype, NULL);
-#else
-	loc = _create_locale(LC_ALL, ctype);
-#endif
-	if (!loc)
-		report_newlocale_failure(ctype);
-
-	return loc;
-}
-#endif
+#endif							/* USE_ICU */
 
 pg_locale_t
 create_pg_locale_icu(Oid collid, MemoryContext context)
@@ -326,7 +304,6 @@ create_pg_locale_icu(Oid collid, MemoryContext context)
 	const char *iculocstr;
 	const char *icurules = NULL;
 	UCollator  *collator;
-	locale_t	loc = (locale_t) 0;
 	pg_locale_t result;
 
 	if (collid == DEFAULT_COLLATION_OID)
@@ -348,18 +325,6 @@ create_pg_locale_icu(Oid collid, MemoryContext context)
 								Anum_pg_database_daticurules, &isnull);
 		if (!isnull)
 			icurules = TextDatumGetCString(datum);
-
-		/* libc only needed for default locale and single-byte encoding */
-		if (pg_database_encoding_max_length() == 1)
-		{
-			const char *ctype;
-
-			datum = SysCacheGetAttrNotNull(DATABASEOID, tp,
-										   Anum_pg_database_datctype);
-			ctype = TextDatumGetCString(datum);
-
-			loc = make_libc_ctype_locale(ctype);
-		}
 
 		ReleaseSysCache(tp);
 	}
@@ -391,7 +356,6 @@ create_pg_locale_icu(Oid collid, MemoryContext context)
 	result = MemoryContextAllocZero(context, sizeof(struct pg_locale_struct));
 	result->icu.locale = MemoryContextStrdup(context, iculocstr);
 	result->icu.ucol = collator;
-	result->icu.lt = loc;
 	result->deterministic = deterministic;
 	result->collate_is_c = false;
 	result->ctype_is_c = false;
@@ -408,24 +372,20 @@ create_pg_locale_icu(Oid collid, MemoryContext context)
 	}
 
 	return result;
-#else
+#else							/* not USE_ICU */
 	/* could get here if a collation was created by a build with ICU */
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("ICU is not supported in this build")));
 
 	return NULL;
-#endif
+#endif							/* not USE_ICU */
 }
 
 #ifdef USE_ICU
 
 /*
  * Check locale string and fix it if necessary. Returns a new palloc'd string.
- *
- * In ICU versions 54 and earlier, "und" is not a recognized spelling of the
- * root locale. If the first component of the locale is "und", replace with
- * "root" before opening.
  */
 static char *
 fix_icu_locale_str(const char *loc_str)
@@ -442,32 +402,10 @@ fix_icu_locale_str(const char *loc_str)
 	if (loc_str == NULL)
 		elog(ERROR, "opening default collator is not supported");
 
-	if (U_ICU_VERSION_MAJOR_NUM < 55)
-	{
-		char		lang[ULOC_LANG_CAPACITY];
-		UErrorCode	status = U_ZERO_ERROR;
-
-		uloc_getLanguage(loc_str, lang, ULOC_LANG_CAPACITY, &status);
-		if (U_FAILURE(status) || status == U_STRING_NOT_TERMINATED_WARNING)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("could not get language from locale \"%s\": %s",
-							loc_str, u_errorName(status))));
-		}
-
-		if (strcmp(lang, "und") == 0)
-		{
-			const char *remainder = loc_str + strlen("und");
-			char	   *fixed_str;
-
-			fixed_str = palloc(strlen("root") + strlen(remainder) + 1);
-			strcpy(fixed_str, "root");
-			strcat(fixed_str, remainder);
-
-			return fixed_str;
-		}
-	}
+	/*
+	 * XXX There are currently no fixups required, but they could be added
+	 * here.
+	 */
 
 	return pstrdup(loc_str);
 }
@@ -495,25 +433,6 @@ pg_ucol_open(const char *loc_str)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("could not open collator for locale \"%s\": %s",
 						loc_str, u_errorName(status))));
-
-	if (U_ICU_VERSION_MAJOR_NUM < 54)
-	{
-		status = U_ZERO_ERROR;
-		icu_set_collation_attributes(collator, fixed_str, &status);
-
-		/*
-		 * Pretend the error came from ucol_open(), for consistent error
-		 * message across ICU versions.
-		 */
-		if (U_FAILURE(status) || status == U_STRING_NOT_TERMINATED_WARNING)
-		{
-			ucol_close(collator);
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("could not open collator for locale \"%s\": %s",
-							loc_str, u_errorName(status))));
-		}
-	}
 
 	pfree(fixed_str);
 
@@ -703,45 +622,10 @@ strfold_icu_utf8(char *dest, size_t destsize, const char *src, size_t srclen,
 }
 
 /*
- * For historical compatibility, behavior is not multibyte-aware.
+ * strncoll_icu_utf8()
  *
- * NB: uses libc tolower() for single-byte encodings (also for historical
- * compatibility), and therefore relies on the global LC_CTYPE setting.
+ * Wrapper for ucol_strcollUTF8().
  */
-static size_t
-downcase_ident_icu(char *dst, size_t dstsize, const char *src,
-				   size_t srclen, pg_locale_t locale)
-{
-	int			i;
-	bool		libc_lower;
-	locale_t	lt = locale->icu.lt;
-
-	libc_lower = lt && (pg_database_encoding_max_length() == 1);
-
-	for (i = 0; i < srclen && i < dstsize; i++)
-	{
-		unsigned char ch = (unsigned char) src[i];
-
-		if (ch >= 'A' && ch <= 'Z')
-			ch = pg_ascii_tolower(ch);
-		else if (libc_lower && IS_HIGHBIT_SET(ch) && isupper_l(ch, lt))
-			ch = tolower_l(ch, lt);
-		dst[i] = (char) ch;
-	}
-
-	if (i < dstsize)
-		dst[i] = '\0';
-
-	return srclen;
-}
-
-/*
- * strncoll_icu_utf8
- *
- * Call ucol_strcollUTF8() or ucol_strcoll() as appropriate for the given
- * database encoding.
- */
-#ifdef HAVE_UCOL_STRCOLLUTF8
 int
 strncoll_icu_utf8(const char *arg1, size_t len1, const char *arg2, size_t len2,
 				  pg_locale_t locale)
@@ -782,7 +666,6 @@ strcoll_icu_utf8(const char *arg1, const char *arg2, pg_locale_t locale)
 
 	return result;
 }
-#endif
 
 static size_t
 strnxfrm_icu_internal(char *dest, size_t destsize, const char *src, ssize_t srclen,
@@ -927,13 +810,11 @@ icu_to_uchar(UChar **buff_uchar, const char *buff, size_t nbytes)
 /*
  * Convert a string of UChars into the database encoding.
  *
- * The source string at buff_uchar is of length len_uchar
- * (it needn't be nul-terminated)
+ * The source string at buff_uchar is of length len_uchar (it needn't be
+ * nul-terminated)
  *
- * *result receives a pointer to the palloc'd result string, and the
- * function's result is the number of bytes generated (not counting nul).
- *
- * The result string is nul-terminated.
+ * If the result length is less than destsize, the NUL-terminated result is
+ * stored in dest. Otherwise the contents of dest are undefined.
  */
 static size_t
 icu_from_uchar(char *dest, size_t destsize, const UChar *buff_uchar, int32_t len_uchar)
@@ -1085,9 +966,7 @@ strncoll_icu_internal(const char *arg1, ssize_t len1,
 	int			result;
 
 	/* if encoding is UTF8, use more efficient strncoll_icu_utf8 */
-#ifdef HAVE_UCOL_STRCOLLUTF8
 	Assert(GetDatabaseEncoding() != PG_UTF8);
-#endif
 
 	init_icu_converter();
 
