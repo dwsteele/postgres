@@ -72,8 +72,8 @@ is( $node_primary->safe_psql(
 	'f',
 	'pg_control_recovery() reports the flag not set on the source cluster');
 
-# pg_resetwal is the only supported way to clear the flag without recovering.
-# Use a copy so the original backup is left intact for the restore tests below.
+# pg_resetwal clears the flag. This is not ideal since it leaves an inconsistent
+# cluster, but at least verify that the flag is cleared.
 my $reset_dir = $node_primary->backup_dir . '/' . $backup_name . '_reset';
 PostgreSQL::Test::RecursiveCopy::copypath(
 	$node_primary->backup_dir . '/' . $backup_name, $reset_dir);
