@@ -47,7 +47,9 @@ tests += {
       'inplace',
       'reindex_concurrently_deferred',
       'repack',
+      'repack_commit_race',
       'repack_decode',
+      'repack_missingval',
       'repack_temporal',
       'repack_temporal_multirange',
       'repack_toast',
@@ -56,6 +58,7 @@ tests += {
       'syscache-update-pruned',
       'wait_cleanup',
       'heap_lock_update',
+      'on_conflict_probe_window',
     ],
     'runningcheck': false, # see syscache-update-pruned
     # Some tests wait for all snapshots, so avoid parallel execution
