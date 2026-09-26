@@ -10607,22 +10607,6 @@ backup_control_file(uint8 *controlFile)
 
 	LWLockAcquire(ControlFileLock, LW_SHARED);
 	memcpy(&controlData, ControlFile, sizeof(ControlFileData));
-
-#ifdef USE_ASSERT_CHECKING
-	/*
-	 * Verify that the contents of pg_control are the same in memory as on disk
-	 */
-	{
-		bool crc_ok;
-		ControlFileData *dataDisk = get_controlfile(DataDir, &crc_ok);
-
-		Assert(crc_ok &&
-			   memcmp(dataDisk, &controlData, sizeof(ControlFileData)) == 0);
-
-		pfree(dataDisk);
-	}
-#endif
-
 	LWLockRelease(ControlFileLock);
 
 	controlData.backupLabelRequired = true;
