@@ -30,8 +30,6 @@ AddForeignUpdateTargets_function
 AddrInfo
 AffixNode
 AffixNodeData
-AfterTriggerBatchCallback
-AfterTriggerCallbackItem
 AfterTriggerEvent
 AfterTriggerEventChunk
 AfterTriggerEventData
@@ -1728,6 +1726,7 @@ MVNDistinctItem
 ManyTestResource
 ManyTestResourceKind
 Material
+MaterialInstrumentation
 MaterialPath
 MaterialState
 MdPathStr
@@ -2501,8 +2500,6 @@ RIX
 RI_CompareHashEntry
 RI_CompareKey
 RI_ConstraintInfo
-RI_FastPathEntry
-RI_FastPathKey
 RI_FastPathState
 RI_QueryHashEntry
 RI_QueryKey
@@ -2865,6 +2862,7 @@ SharedInvalSmgrMsg
 SharedInvalSnapshotMsg
 SharedInvalidationMessage
 SharedJitInstrumentation
+SharedMaterialInfo
 SharedMemoizeInfo
 SharedRecordTableEntry
 SharedRecordTableKey
@@ -3593,6 +3591,7 @@ array_unnest_fctx
 assign_collations_context
 astreamer
 astreamer_archive_context
+astreamer_decompression_state
 astreamer_extractor
 astreamer_gzip_decompressor
 astreamer_gzip_writer

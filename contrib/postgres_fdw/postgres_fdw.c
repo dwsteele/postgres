@@ -5430,7 +5430,7 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 	 * Error-out if explicitly required one of the TABLESAMPLE methods, but
 	 * the server does not support it.
 	 */
-	if ((server_version_num < 95000) &&
+	if ((server_version_num < 90500) &&
 		(method == ANALYZE_SAMPLE_SYSTEM ||
 		 method == ANALYZE_SAMPLE_BERNOULLI))
 		ereport(ERROR,
@@ -5507,7 +5507,7 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 	 */
 	if (method == ANALYZE_SAMPLE_AUTO)
 	{
-		if (server_version_num < 95000)
+		if (server_version_num < 90500)
 			method = ANALYZE_SAMPLE_RANDOM;
 		else
 			method = ANALYZE_SAMPLE_BERNOULLI;
@@ -6476,7 +6476,7 @@ set_float_arg(NullableDatum *arg, const char *s)
 {
 	if (s)
 	{
-		float4		val = float4in_internal((char *) s, NULL, "float", s, NULL);
+		float4		val = float4in_internal(s, NULL, "float", s, NULL);
 
 		arg->value = Float4GetDatum(val);
 		arg->isnull = false;

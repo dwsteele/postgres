@@ -270,6 +270,8 @@ static int	PrivateRefCountEntryLast = -1;
 
 static uint32 MaxProportionalPins;
 
+static WritebackContext BackendWritebackContext;
+
 static void ReservePrivateRefCountEntry(void);
 static PrivateRefCountEntry *NewPrivateRefCountEntry(Buffer buffer);
 static PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move);
@@ -4251,6 +4253,10 @@ InitBufferManagerAccess(void)
 	memset(&PrivateRefCountArrayKeys, 0, sizeof(PrivateRefCountArrayKeys));
 
 	PrivateRefCountHash = refcount_create(CurrentMemoryContext, 100, NULL);
+
+	/* Initialize per-backend file flush context */
+	WritebackContextInit(&BackendWritebackContext,
+						 &backend_flush_after);
 
 	/*
 	 * AtProcExit_Buffers needs LWLock access, and thereby has to be called at
@@ -8684,7 +8690,7 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 			buffer_readv_encode_error(&result_one, is_temp,
 									  *zeroed_buffer,
 									  *ignored_checksum,
-									  *buffer_invalid,
+									  *buffer_invalid ? 1 : 0,
 									  *zeroed_buffer ? 1 : 0,
 									  *failed_checksum ? 1 : 0,
 									  buf_off, buf_off, buf_off);

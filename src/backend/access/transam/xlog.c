@@ -1850,6 +1850,7 @@ WALReadFromBuffers(char *dstbuf, XLogRecPtr startptr, Size count,
 	XLogRecPtr	recptr = startptr;
 	XLogRecPtr	inserted;
 	Size		nbytes = count;
+	uint32		npages = 0;
 
 	if (RecoveryInProgress() || tli != GetWALInsertionTimeLine())
 		return 0;
@@ -1940,9 +1941,14 @@ WALReadFromBuffers(char *dstbuf, XLogRecPtr startptr, Size count,
 		pdst += npagebytes;
 		recptr += npagebytes;
 		nbytes -= npagebytes;
+		npages++;
 	}
 
 	Assert(pdst - dstbuf <= count);
+
+	/* Report the pages read from the WAL buffers. */
+	if (npages > 0)
+		pgstat_count_io_op(IOOBJECT_WAL, IOCONTEXT_NORMAL, IOOP_HIT, npages, 0);
 
 	return pdst - dstbuf;
 }
@@ -5570,22 +5576,6 @@ XLOGShmemInit(void *arg)
 	char	   *allocptr;
 	int			i;
 
-#ifdef WAL_DEBUG
-
-	/*
-	 * Create a memory context for WAL debugging that's exempt from the normal
-	 * "no pallocs in critical section" rule. Yes, that can lead to a PANIC if
-	 * an allocation fails, but wal_debug is not for production use anyway.
-	 */
-	if (walDebugCxt == NULL)
-	{
-		walDebugCxt = AllocSetContextCreate(TopMemoryContext,
-											"WAL Debug",
-											ALLOCSET_DEFAULT_SIZES);
-		MemoryContextAllowInCriticalSection(walDebugCxt, true);
-	}
-#endif
-
 	memset(XLogCtl, 0, sizeof(XLogCtlData));
 
 	/*
@@ -5668,6 +5658,30 @@ XLOGShmemAttach(void *arg)
 {
 	WALInsertLocks = XLogCtl->Insert.WALInsertLocks;
 }
+
+/*
+ * Initialize process-local state needed by wal_debug.
+ *
+ * This must be called before XLogInsertRecord().
+ */
+#ifdef WAL_DEBUG
+void
+InitWalDebug(void)
+{
+	/*
+	 * Create a memory context for WAL debugging that's exempt from the normal
+	 * "no pallocs in critical section" rule. Yes, that can lead to a PANIC if
+	 * an allocation fails, but wal_debug is not for production use anyway.
+	 */
+	if (walDebugCxt == NULL)
+	{
+		walDebugCxt = AllocSetContextCreate(TopMemoryContext,
+											"WAL Debug",
+											ALLOCSET_DEFAULT_SIZES);
+		MemoryContextAllowInCriticalSection(walDebugCxt, true);
+	}
+}
+#endif
 
 /*
  * This func must be called ONCE on system install.  It creates pg_control
@@ -9649,7 +9663,7 @@ xlog_redo(XLogReaderState *record)
 		 * subsequent WAL records, which may not contain logical information.
 		 */
 		if (status)
-			EnableLogicalDecoding();
+			EnableLogicalDecoding(lsn);
 		else
 			DisableLogicalDecoding();
 
@@ -9994,6 +10008,11 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("backup label too long (max %d bytes)",
 						MAXPGPATH)));
+
+	if (strpbrk(backupidstr, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("backup label contains a newline or carriage return character")));
 
 	strlcpy(state->name, backupidstr, sizeof(state->name));
 

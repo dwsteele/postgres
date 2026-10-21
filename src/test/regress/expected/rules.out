@@ -1973,8 +1973,9 @@ pg_stat_kind_info| SELECT id,
     fixed_amount,
     accessed_across_databases,
     write_to_file,
+    own_hash,
     entry_count
-   FROM pg_stat_get_kind_info() k(id, name, builtin, fixed_amount, accessed_across_databases, write_to_file, entry_count);
+   FROM pg_stat_get_kind_info() k(id, name, builtin, fixed_amount, accessed_across_databases, write_to_file, own_hash, entry_count);
 pg_stat_lock| SELECT locktype,
     waits,
     wait_time,
@@ -2214,7 +2215,10 @@ pg_stat_progress_vacuum| SELECT s.pid,
             WHEN 2 THEN 'autovacuum'::text
             WHEN 3 THEN 'autovacuum_wraparound'::text
             ELSE NULL::text
-        END AS started_by
+        END AS started_by,
+    (s.param14)::oid AS current_index_relid,
+    s.param16 AS index_blks_total,
+    s.param17 AS index_blks_done
    FROM (pg_stat_get_progress_info('VACUUM'::text) s(pid, datid, relid, param1, param2, param3, param4, param5, param6, param7, param8, param9, param10, param11, param12, param13, param14, param15, param16, param17, param18, param19, param20)
      LEFT JOIN pg_database d ON ((s.datid = d.oid)));
 pg_stat_recovery| SELECT promote_triggered,
@@ -3329,7 +3333,7 @@ Rules:
   RETURNING trgt.f1,
     trgt.f2
     r6 AS
-    ON UPDATE TO rules_src DO INSTEAD  UPDATE rules_log trgt SET tag = 'updated'::text
+    ON UPDATE TO rules_src DO INSTEAD  UPDATE rules_log AS trgt SET tag = 'updated'::text
   WHERE trgt.f1 = new.f1
     r7 AS
     ON DELETE TO rules_src DO INSTEAD  WITH wins AS (
@@ -3337,10 +3341,10 @@ Rules:
           VALUES (0)
           RETURNING trgt_1.f1
         ), wupd AS (
-         UPDATE int4_tbl trgt_1 SET f1 = trgt_1.f1 + 1
+         UPDATE int4_tbl AS trgt_1 SET f1 = trgt_1.f1 + 1
           RETURNING trgt_1.f1
         ), wdel AS (
-         DELETE FROM int4_tbl trgt_1
+         DELETE FROM int4_tbl AS trgt_1
           WHERE trgt_1.f1 = 0
           RETURNING trgt_1.f1
         )
@@ -3368,7 +3372,7 @@ create rule rr as on update to rule_t1 do instead UPDATE rule_dest trgt
  f2     | integer |           |          |         | plain   |              | 
 Rules:
     rr AS
-    ON UPDATE TO rule_t1 DO INSTEAD  UPDATE rule_dest trgt SET (f2[1], f1, tag) = ( SELECT new.f2,
+    ON UPDATE TO rule_t1 DO INSTEAD  UPDATE rule_dest AS trgt SET (f2[1], f1, tag) = ( SELECT new.f2,
             new.f1,
             'updated'::character varying AS "varchar")
   WHERE trgt.f1 = new.f1
@@ -3989,7 +3993,7 @@ CREATE OR REPLACE FUNCTION public.merge_sf_test()
  RETURNS TABLE(action text, a integer, b text, id integer, data text, filling integer[], old_id integer, old_data text, old_filling integer[], new_id integer, new_data text, new_filling integer[])
  LANGUAGE sql
 BEGIN ATOMIC
- MERGE INTO sf_target t
+ MERGE INTO sf_target AS t
     USING rule_merge1 s
     ON (s.a = t.id)
     WHEN MATCHED
@@ -4057,7 +4061,7 @@ CREATE OR REPLACE FUNCTION public.merge_sf_test2()
  RETURNS void
  LANGUAGE sql
 BEGIN ATOMIC
- MERGE INTO sf_target t
+ MERGE INTO sf_target AS t
     USING rule_merge1 s
     ON (s.a = t.id)
     WHEN NOT MATCHED BY TARGET

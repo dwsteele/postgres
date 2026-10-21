@@ -3621,14 +3621,25 @@ l2:
 			else
 				update_xact = InvalidTransactionId;
 
-			/*
-			 * There was no UPDATE in the MultiXact; or it aborted. No
-			 * TransactionIdIsInProgress() call needed here, since we called
-			 * MultiXactIdWait() above.
-			 */
-			if (!TransactionIdIsValid(update_xact) ||
-				TransactionIdDidAbort(update_xact))
+			if (!TransactionIdIsValid(update_xact))
+			{
+				/* no UPDATE in the MultiXact */
 				can_continue = true;
+			}
+			else
+			{
+				/*
+				 * There was another UPDATE.  Did it abort?
+				 *
+				 * Note: We check !TransactionIdDidCommit() instead of
+				 * TransactionIdDidAbort(), to treat crashed transactions as
+				 * aborted.  No TransactionIdIsInProgress() call is needed
+				 * here, because the MultiXactIdWait() call above already
+				 * waited for it to finish.
+				 */
+				if (!TransactionIdDidCommit(update_xact))
+					can_continue = true;
+			}
 		}
 		else if (TransactionIdIsCurrentTransactionId(xwait))
 		{
@@ -6574,6 +6585,7 @@ heap_abort_speculative(Relation relation, const ItemPointerData *tid)
  * consequence that the table's next VACUUM could see the table's relfrozenxid
  * move forward between vacuum_get_cutoffs() and finishing.
  */
+pg_attribute_no_sanitize_function()
 bool
 heap_inplace_lock(Relation relation,
 				  HeapTuple oldtup_ptr, Buffer buffer,
@@ -7863,8 +7875,9 @@ DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
 
 			if (ISUPDATE_from_mxstatus(members[i].status))
 			{
-				/* ignore aborted updaters */
-				if (TransactionIdDidAbort(memxid))
+				/* ignore aborted (or crashed) updaters */
+				if (!TransactionIdIsInProgress(memxid) &&
+					!TransactionIdDidCommit(memxid))
 					continue;
 			}
 			else

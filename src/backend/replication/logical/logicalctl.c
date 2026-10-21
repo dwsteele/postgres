@@ -64,6 +64,7 @@
 #include "postgres.h"
 
 #include "access/xloginsert.h"
+#include "access/xlogrecovery.h"
 #include "catalog/pg_control.h"
 #include "miscadmin.h"
 #include "replication/slot.h"
@@ -95,14 +96,32 @@ typedef struct LogicalDecodingCtlData
 
 	/* True if logical decoding might need to be disabled */
 	bool		pending_disable;
+
+	/*
+	 * End LSN of the last XLOG_LOGICAL_DECODING_STATUS_CHANGE record that
+	 * enabled logical decoding, or InvalidXLogRecPtr if none has been
+	 * replayed since the server started. Checking it with
+	 * logical_decoding_enabled tells from which point on WAL was written with
+	 * logical decoding enabled; see StandbyLogicalDecodingEnabledSince().
+	 *
+	 * WAL records that disable logical decoding are deliberately not tracked
+	 * here. logical_decoding_enabled is false while decoding is off, which is
+	 * all the check needs.
+	 *
+	 * This is maintained only during recovery and is not persisted, so it
+	 * says nothing about a status change replayed in an earlier server run.
+	 */
+	XLogRecPtr	last_replayed_enable_lsn;
 } LogicalDecodingCtlData;
 
 static LogicalDecodingCtlData *LogicalDecodingCtl = NULL;
 
 static void LogicalDecodingCtlShmemRequest(void *arg);
+static void LogicalDecodingCtlShmemInit(void *arg);
 
 const ShmemCallbacks LogicalDecodingCtlShmemCallbacks = {
 	.request_fn = LogicalDecodingCtlShmemRequest,
+	.init_fn = LogicalDecodingCtlShmemInit,
 };
 
 /*
@@ -134,6 +153,15 @@ LogicalDecodingCtlShmemRequest(void *arg)
 					   .size = sizeof(LogicalDecodingCtlData),
 					   .ptr = (void **) &LogicalDecodingCtl,
 		);
+}
+
+static void
+LogicalDecodingCtlShmemInit(void *arg)
+{
+	LogicalDecodingCtl->xlog_logical_info = false;
+	LogicalDecodingCtl->logical_decoding_enabled = false;
+	LogicalDecodingCtl->pending_disable = false;
+	LogicalDecodingCtl->last_replayed_enable_lsn = InvalidXLogRecPtr;
 }
 
 /*
@@ -211,6 +239,31 @@ IsLogicalDecodingEnabled(void)
 }
 
 /*
+ * Return true if logical decoding has been enabled continuously from the given
+ * LSN up to the current replay position, that is, if the WAL in that range
+ * was written with logical decoding enabled.
+ *
+ * The given LSN must have been replayed already; nothing can be said about
+ * WAL this server has not replayed yet. The caller is responsible for checking
+ * that.
+ */
+bool
+StandbyLogicalDecodingEnabledSince(XLogRecPtr lsn)
+{
+	bool		result;
+
+	Assert(RecoveryInProgress());
+	Assert(lsn <= GetXLogReplayRecPtr(NULL));
+
+	LWLockAcquire(LogicalDecodingControlLock, LW_SHARED);
+	result = LogicalDecodingCtl->logical_decoding_enabled &&
+		lsn >= LogicalDecodingCtl->last_replayed_enable_lsn;
+	LWLockRelease(LogicalDecodingControlLock);
+
+	return result;
+}
+
+/*
  * Returns true if logical WAL logging is enabled based on the shared memory
  * status.
  */
@@ -227,7 +280,11 @@ IsXLogLogicalInfoEnabled(void)
 }
 
 /*
- * Reset the local cache at end of the transaction.
+ * Apply a pending XLogLogicalInfo update at end of the top-level transaction.
+ *
+ * This is called from CommitTransaction(), PrepareTransaction(), and
+ * CleanupTransaction(), which are the only places where the top-level XID is
+ * reset, so the next transaction always starts with the latest value.
  */
 void
 AtEOXact_LogicalCtl(void)
@@ -330,20 +387,35 @@ EnsureLogicalDecodingEnabled(void)
 	 */
 	PG_ENSURE_ERROR_CLEANUP(abort_logical_decoding_activation, (Datum) 0);
 	{
-		EnableLogicalDecoding();
+		EnableLogicalDecoding(InvalidXLogRecPtr);
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(abort_logical_decoding_activation, (Datum) 0);
 }
 
 /*
  * A workhorse function to enable logical decoding.
+ *
+ * lsn is the end LSN of the XLOG_LOGICAL_DECODING_STATUS_CHANGE record
+ * being replayed, and is InvalidXLogRecPtr when not called from redo.
  */
 void
-EnableLogicalDecoding(void)
+EnableLogicalDecoding(XLogRecPtr lsn)
 {
 	bool		in_recovery;
 
 	LWLockAcquire(LogicalDecodingControlLock, LW_EXCLUSIVE);
+
+	/*
+	 * Remember where logical decoding was enabled. This has to happen before
+	 * the early return below, because replay can reach here with the status
+	 * already on. For example, CreateCheckPoint() fixes the redo point before
+	 * it records logicalDecodingEnabled, so a checkpoint can claim logical
+	 * decoding is enabled while the record that enabled it still follows the
+	 * redo point.
+	 */
+	Assert(RecoveryInProgress() == XLogRecPtrIsValid(lsn));
+	if (XLogRecPtrIsValid(lsn))
+		LogicalDecodingCtl->last_replayed_enable_lsn = lsn;
 
 	/* Return if it is already enabled */
 	if (LogicalDecodingCtl->logical_decoding_enabled)
@@ -592,9 +664,9 @@ DisableLogicalDecoding(void)
 }
 
 /*
- * Updates the logical decoding status at end of recovery, and ensures that
- * all running processes have the updated XLogLogicalInfo status. This
- * function must be called before accepting writes.
+ * Update the logical decoding status at end of recovery, synchronizing
+ * process-local WAL logging state when necessary. This function must
+ * be called before accepting writes.
  */
 void
 UpdateLogicalDecodingStatusEndOfRecovery(void)
@@ -674,16 +746,25 @@ UpdateLogicalDecodingStatusEndOfRecovery(void)
 		LWLockRelease(LogicalDecodingControlLock);
 
 	/*
-	 * Ensure all running processes have the updated status. We don't need to
-	 * wait for running transactions to finish as we don't accept any writes
-	 * yet. On the other hand, we need to wait for synchronizing
-	 * XLogLogicalInfo even if we've not updated the status above as the
-	 * status have been turned on and off during recovery, having running
-	 * processes have different status on their local caches.
+	 * With wal_level = logical, XLogLogicalInfoActive() is always true, so no
+	 * barrier is needed.
+	 *
+	 * Otherwise, notify all processes to refresh XLogLogicalInfo. Wait only
+	 * if new_status is true, even if the shared status is unchanged, since
+	 * recovery may have left stale caches. Writes are not yet allowed, so we
+	 * need not wait for running transactions to finish.
+	 *
+	 * If new_status is false, stale caches only cause extra logical
+	 * information in WAL, which is safe (see DisableLogicalDecoding()).
 	 */
-	if (IsUnderPostmaster)
-		WaitForProcSignalBarrier(
-								 EmitProcSignalBarrier(PROCSIGNAL_BARRIER_UPDATE_XLOG_LOGICAL_INFO));
+	if (IsUnderPostmaster && wal_level != WAL_LEVEL_LOGICAL)
+	{
+		uint64		generation;
+
+		generation = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_UPDATE_XLOG_LOGICAL_INFO);
+		if (new_status)
+			WaitForProcSignalBarrier(generation);
+	}
 
 	INJECTION_POINT("startup-logical-decoding-status-change-end-of-recovery", NULL);
 }

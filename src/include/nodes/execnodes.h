@@ -1999,6 +1999,7 @@ typedef struct TableFuncScanState
 	int64		ordinal;		/* row number to be output next */
 	MemoryContext perTableCxt;	/* per-table context */
 	Tuplestorestate *tupstore;	/* output tuple store */
+	bool		tupstore_filled;	/* tuplestore filled yet? */
 } TableFuncScanState;
 
 /* ----------------
@@ -2258,6 +2259,7 @@ typedef struct MaterialState
 	int			eflags;			/* capability flags to pass to tuplestore */
 	bool		eof_underlying; /* reached end of underlying plan? */
 	Tuplestorestate *tuplestorestate;
+	SharedMaterialInfo *shared_info;	/* statistics for parallel workers */
 } MaterialState;
 
 struct MemoizeEntry;

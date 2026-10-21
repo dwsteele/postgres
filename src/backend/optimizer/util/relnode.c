@@ -532,6 +532,13 @@ build_grouped_rel(PlannerInfo *root, RelOptInfo *rel)
 	grouped_rel->consider_partitionwise_join = false;
 
 	/*
+	 * clear FDW info; FDWs don't know how to handle grouped relations
+	 */
+	grouped_rel->serverid = InvalidOid;
+	grouped_rel->fdwroutine = NULL;
+	grouped_rel->fdw_private = NULL;
+
+	/*
 	 * clear size estimates
 	 */
 	grouped_rel->rows = 0;
@@ -2957,11 +2964,9 @@ eager_aggregation_possible_for_relation(PlannerInfo *root, RelOptInfo *rel)
 	 * computed on the inner side would not survive the join and could not be
 	 * combined by the final aggregation.
 	 *
-	 * Note that an anti join reduced from an outer join null-extends its
-	 * inner side, so that inner relation already carries nulling_relids and
-	 * is handled by the outer-join check above.  The case this check adds is
-	 * a semi/anti join that does not null-extend its inner side, such as one
-	 * formed from an EXISTS, IN, NOT EXISTS, or NOT IN sublink.
+	 * Note that the inner side of an anti join already carries nulling_relids
+	 * and so is handled by the outer-join check above.  The case this check
+	 * adds is a semi join, which has no relid.
 	 */
 	foreach(lc, root->join_info_list)
 	{
@@ -3327,6 +3332,10 @@ get_expression_sortgroupref(PlannerInfo *root, Expr *expr)
 
 		if (ge_info->ec == NULL ||
 			!bms_is_member(((Var *) expr)->varno, ge_info->ec->ec_relids))
+			continue;
+
+		/* The grouping operators can't be applied to a cross-type member */
+		if (exprType((Node *) expr) != exprType((Node *) ge_info->expr))
 			continue;
 
 		/*

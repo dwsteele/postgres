@@ -192,8 +192,8 @@ static void apply_concurrent_update(Relation rel, TupleTableSlot *spilled_tuple,
 static void apply_concurrent_delete(Relation rel, TupleTableSlot *slot);
 static void restore_tuple(BufFile *file, Relation relation,
 						  TupleTableSlot *slot);
-static void adjust_toast_pointers(Relation relation, TupleTableSlot *dest,
-								  TupleTableSlot *src);
+static void prepare_concurrent_update(TupleTableSlot *dest,
+									  TupleTableSlot *src);
 static bool find_target_tuple(Relation rel, ChangeContext *chgcxt,
 							  TupleTableSlot *locator,
 							  TupleTableSlot *retrieved);
@@ -535,6 +535,16 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 	 */
 	if (concurrent)
 		check_concurrent_repack_requirements(OldHeap, &ident_idx);
+
+	/*
+	 * In concurrent mode, also lock the toast table.  Otherwise it would be
+	 * possible for the toast relfilenode to change (e.g. because VACUUM FULL
+	 * or REPACK is run on it).  This would break concurrent repack's system
+	 * for skipping decoding changes in other tables -- see
+	 * change_useless_for_repack().
+	 */
+	if (concurrent && OidIsValid(OldHeap->rd_rel->reltoastrelid))
+		LockRelationOid(OldHeap->rd_rel->reltoastrelid, lmode);
 
 	/*
 	 * Also check the state of indexes; this can abort the command for REPACK.
@@ -1137,16 +1147,22 @@ rebuild_relation(Relation OldHeap, Relation index, bool verbose,
 		BecomeLockGroupLeader();
 
 		/*
+		 * If there is a toast table, it must have been locked already.
+		 * Otherwise we risk it changing underneath us (catastrophic).
+		 */
+		Assert(!OidIsValid(OldHeap->rd_rel->reltoastrelid) ||
+			   CheckRelationOidLockedByMe(OldHeap->rd_rel->reltoastrelid,
+										  lmode, false));
+
+		/*
 		 * Start the worker that decodes data changes applied while we're
 		 * copying the table contents.
 		 *
 		 * Note that the worker has to wait for all transactions with XID
 		 * already assigned to finish. If some of those transactions is
 		 * waiting for a lock conflicting with ShareUpdateExclusiveLock on our
-		 * table (e.g.  it runs CREATE INDEX), we can end up in a deadlock.
-		 * Not sure this risk is worth unlocking/locking the table (and its
-		 * clustering index) and checking again if it's still eligible for
-		 * REPACK CONCURRENTLY.
+		 * table or its TOAST relation (e.g. it runs CREATE INDEX), we can end
+		 * up in a deadlock.
 		 */
 		start_repack_decoding_worker(tableOid);
 
@@ -1431,9 +1447,17 @@ copy_table_data(Relation NewHeap, Relation OldHeap, Relation OldIndex,
 	 *
 	 * We don't need to open the toast relation here, just lock it.  The lock
 	 * will be held till end of transaction.
+	 *
+	 * Concurrent repack must hold this lock already; see cluster_rel().
 	 */
 	if (OldHeap->rd_rel->reltoastrelid)
-		LockRelationOid(OldHeap->rd_rel->reltoastrelid, lmode);
+	{
+		if (!concurrent)
+			LockRelationOid(OldHeap->rd_rel->reltoastrelid, lmode);
+		else
+			Assert(CheckRelationOidLockedByMe(OldHeap->rd_rel->reltoastrelid,
+											  lmode, false));
+	}
 
 	/*
 	 * If both tables have TOAST tables, perform toast swap by content.  It is
@@ -2408,7 +2432,46 @@ get_tables_to_repack_partitioned(RepackStmt *stmt, Relation rel,
 	 * Do not lock the children until they're processed.  Note that we do hold
 	 * a lock on the parent partitioned table.
 	 */
-	inhoids = find_all_inheritors(relid, NoLock, NULL);
+	inhoids = find_all_inheritors(RelationGetRelid(rel), NoLock, NULL);
+
+	/*
+	 * Warn about foreign-table partitions, which have no local storage and
+	 * would otherwise be skipped silently.  This has to look at the table's
+	 * partition tree: when an index is specified, the walk below covers the
+	 * index's partition tree, which cannot contain foreign tables.  Check
+	 * privileges first, like VACUUM does, so that a user who may not process
+	 * the partition gets the permission warning instead.
+	 */
+	foreach_oid(tableoid, inhoids)
+	{
+		char	   *relname;
+
+		if (get_rel_relkind(tableoid) != RELKIND_FOREIGN_TABLE ||
+			!repack_is_permitted_for_relation(stmt->command, tableoid,
+											  GetUserId(), false))
+			continue;
+
+		/*
+		 * We don't hold a lock on the partition's immediate parent if it's
+		 * below the first level, so it may have been dropped concurrently.
+		 */
+		relname = get_rel_name(tableoid);
+		if (relname == NULL)
+			continue;
+
+		ereport(WARNING,
+		/*- translator: second %s is the name of a SQL command, eg. REPACK */
+				errmsg("skipping \"%s\" --- cannot execute %s on foreign tables",
+					   relname, RepackCommandAsString(stmt->command)));
+		pfree(relname);
+	}
+
+	if (rel_is_index)
+	{
+		list_free(inhoids);
+		inhoids = find_all_inheritors(relid, NoLock, NULL);
+	}
+
 	foreach_oid(child_oid, inhoids)
 	{
 		Oid			table_oid,
@@ -2793,13 +2856,11 @@ apply_concurrent_changes(BufFile *file, ChangeContext *chgcxt)
 				elog(ERROR, "could not find target tuple");
 
 			/*
-			 * If 'tup' contains TOAST pointers, they point to the old
-			 * relation's toast. Copy the corresponding TOAST pointers for the
-			 * new relation from the existing tuple. (The fact that we
-			 * received a TOAST pointer here implies that the attribute hasn't
-			 * changed.)
+			 * Adjust spilled_tuple so that it can be used as the new tuple in
+			 * the update that we're about to replay.  This fixes TOAST
+			 * pointers.
 			 */
-			adjust_toast_pointers(rel, spilled_tuple, ondisk_tuple);
+			prepare_concurrent_update(spilled_tuple, ondisk_tuple);
 
 			apply_concurrent_update(rel, spilled_tuple, ondisk_tuple, chgcxt);
 
@@ -2926,6 +2987,7 @@ restore_tuple(BufFile *file, Relation relation, TupleTableSlot *slot)
 {
 	uint32		t_len;
 	HeapTuple	tup;
+	TupleDesc	desc = slot->tts_tupleDescriptor;
 	int			natt_ext;
 
 	/* Read the tuple. */
@@ -2944,6 +3006,16 @@ restore_tuple(BufFile *file, Relation relation, TupleTableSlot *slot)
 	ExecForceStoreHeapTuple(tup, slot, false);
 
 	/*
+	 * Dropped columns can still have values in some tuples.  Null them out.
+	 * This saves space, and the new heap might not even have a TOAST table.
+	 */
+	for (int i = 0; i < desc->natts; i++)
+	{
+		if (TupleDescCompactAttr(desc, i)->attisdropped)
+			slot->tts_isnull[i] = true;
+	}
+
+	/*
 	 * Next, read any attributes we stored separately into the tts_values
 	 * array elements expecting them, if any.  This matches
 	 * repack_store_change.
@@ -2951,8 +3023,6 @@ restore_tuple(BufFile *file, Relation relation, TupleTableSlot *slot)
 	BufFileReadExact(file, &natt_ext, sizeof(natt_ext));
 	if (natt_ext > 0)
 	{
-		TupleDesc	desc = slot->tts_tupleDescriptor;
-
 		for (int i = 0; i < desc->natts; i++)
 		{
 			CompactAttribute *attr = TupleDescCompactAttr(desc, i);
@@ -2991,11 +3061,17 @@ restore_tuple(BufFile *file, Relation relation, TupleTableSlot *slot)
 }
 
 /*
- * Adjust 'dest' replacing any EXTERNAL_ONDISK toast pointers with the
- * corresponding ones from 'src'.
+ * Adjust the tuple in 'dest' so that it can be used as the NEW tuple in an
+ * update that we're about to replay.
+ *
+ * We perform the following critical change:
+ * - Update any EXTERNAL_ONDISK toast pointers so that they point to the
+ *   corresponding toast values in 'src' (the transient table) instead.
+ *   The TOAST storage for 'dest' is going to be dropped, so these values
+ *   cannot be used any longer.
  */
 static void
-adjust_toast_pointers(Relation relation, TupleTableSlot *dest, TupleTableSlot *src)
+prepare_concurrent_update(TupleTableSlot *dest, TupleTableSlot *src)
 {
 	TupleDesc	desc = dest->tts_tupleDescriptor;
 
