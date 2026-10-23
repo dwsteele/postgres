@@ -10612,7 +10612,7 @@ do_pg_abort_backup(int code, Datum arg)
  * Create a consistent copy of control data to be used for backup.
  *
  * Reading pg_control from disk while it is being rewritten can return a torn
- * copy, so take the copy from shared memory under ControlFileLock instead.
+ * copy, so make the copy from shared memory under ControlFileLock instead.
  *
  * The caller's buffer must be at least PG_CONTROL_FILE_SIZE bytes and is
  * zero-padded to that size.
