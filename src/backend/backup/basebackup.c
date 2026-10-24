@@ -27,6 +27,7 @@
 #include "catalog/pg_tablespace_d.h"
 #include "commands/defrem.h"
 #include "common/compression.h"
+#include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "common/file_utils.h"
 #include "lib/stringinfo.h"
@@ -43,6 +44,7 @@
 #include "storage/checksum.h"
 #include "storage/dsm_impl.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
 #include "storage/reinit.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -343,7 +345,9 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 			{
 				bool		sendtblspclinks = true;
 				char	   *backup_label;
-				uint8		controlFile[PG_CONTROL_FILE_SIZE];
+				ControlFileData *controlData;
+				bool		crc_ok;
+				char		controlFile[PG_CONTROL_FILE_SIZE];
 
 				bbsink_begin_archive(sink, "base.tar");
 
@@ -365,10 +369,34 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 				sendDir(sink, ".", 1, false, state.tablespaces,
 						sendtblspclinks, &manifest, InvalidOid, ib);
 
-				/* ... and pg_control after everything else. */
-				backup_control_file(controlFile);
+				/*
+				 * ... and pg_control after everything else. Read it while
+				 * holding ControlFileLock so that a concurrent write cannot
+				 * produce a torn copy.
+				 */
+				LWLockAcquire(ControlFileLock, LW_SHARED);
+				controlData = get_controlfile(DataDir, &crc_ok);
+				LWLockRelease(ControlFileLock);
+
+				if (!crc_ok)
+					ereport(ERROR,
+							(errmsg("calculated CRC checksum does not match value stored in file")));
+
+				/* Require backup_label for recovery from this backup */
+				controlData->backupLabelRequired = true;
+
+				INIT_CRC32C(controlData->crc);
+				COMP_CRC32C(controlData->crc, controlData,
+							offsetof(ControlFileData, crc));
+				FIN_CRC32C(controlData->crc);
+
+				/* Send the full file, zero-padded as it is on disk */
+				memset(controlFile, 0, PG_CONTROL_FILE_SIZE);
+				memcpy(controlFile, controlData, sizeof(ControlFileData));
+				pfree(controlData);
+
 				sendFileWithContent(sink, XLOG_CONTROL_FILE,
-									(char *) controlFile, PG_CONTROL_FILE_SIZE,
+									controlFile, PG_CONTROL_FILE_SIZE,
 									&manifest);
 			}
 			else
