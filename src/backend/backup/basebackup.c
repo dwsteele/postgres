@@ -1611,9 +1611,10 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 	}
 
 	/*
-	 * Non-relation files may be replaced by rename between the caller's stat
-	 * and our open. fstat() the file we opened to avoid truncating or
-	 * zero-padding its contents, which WAL replay cannot repair.
+	 * Non-relation files, e.g. postgresql.auto.conf, may be replaced by
+	 * rename between the caller's stat and our open. fstat() the file we
+	 * opened to avoid truncating or zero-padding its contents, which WAL
+	 * replay cannot repair.
 	 */
 	if (!RelFileNumberIsValid(relfilenumber) && fstat(fd, statbuf) != 0)
 		ereport(ERROR,
