@@ -1041,8 +1041,6 @@ SELECT * FROM pg_backup_stop(wait_for_archive => true);
      recorded in <filename>pg_control</filename>. Unless that happens to be the
      checkpoint the backup started from, recovery will begin too late and
      silently produce an inconsistent cluster.
-     Backup software using this API should set the flag itself if it is able to
-     modify <filename>pg_control</filename>.
     </para>
    </listitem>
    <listitem>
